@@ -591,10 +591,10 @@ class CausalSelfAttention(nn.Module):
             attn_weights = torch.matmul(q, k.transpose(-2, -1)) * scale  # (bsz, heads, seqlen, kv_len)
             # Causal mask: query at position i can attend to pooled position j
             # where j covers original positions [j*s, (j+1)*s - 1]
-            # Allow if (j+1)*s - 1 <= i
+            # Allow if j*s <= i (pooled group's start position <= query position)
             q_pos = torch.arange(seqlen, device=x.device).unsqueeze(1)  # (seqlen, 1)
-            kv_end = (torch.arange(kv_len, device=x.device) + 1) * s - 1  # (kv_len,)
-            causal_mask = q_pos < kv_end.unsqueeze(0)  # (seqlen, kv_len), True = masked
+            kv_start = torch.arange(kv_len, device=x.device) * s  # (kv_len,)
+            causal_mask = q_pos < kv_start.unsqueeze(0)  # (seqlen, kv_len), True = masked
             attn_weights = attn_weights.masked_fill(causal_mask.unsqueeze(0).unsqueeze(0), float('-inf'))
             attn_weights = F.softmax(attn_weights, dim=-1)
             y = torch.matmul(attn_weights, v)
