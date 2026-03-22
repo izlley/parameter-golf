@@ -586,16 +586,18 @@ class CausalSelfAttention(nn.Module):
                 repeat = self.num_heads // self.num_kv_heads
                 k = k[:, :, None, :, :].expand(-1, -1, repeat, -1, -1).reshape(bsz, self.num_heads, kv_len, self.head_dim)
                 v = v[:, :, None, :, :].expand(-1, -1, repeat, -1, -1).reshape(bsz, self.num_heads, kv_len, self.head_dim)
+            # Manual attention: SDPA doesn't support asymmetric Q/KV lengths with masks in compile mode
+            scale = 1.0 / math.sqrt(self.head_dim)
+            attn_weights = torch.matmul(q, k.transpose(-2, -1)) * scale  # (bsz, heads, seqlen, kv_len)
             # Causal mask: query at position i can attend to pooled position j
             # where j covers original positions [j*s, (j+1)*s - 1]
-            # Allow if (j+1)*s - 1 <= i, i.e., j <= (i - s + 1) / s
-            # Build mask: (seqlen, kv_len)
+            # Allow if (j+1)*s - 1 <= i
             q_pos = torch.arange(seqlen, device=x.device).unsqueeze(1)  # (seqlen, 1)
             kv_end = (torch.arange(kv_len, device=x.device) + 1) * s - 1  # (kv_len,)
-            attn_mask = q_pos >= kv_end.unsqueeze(0)  # (seqlen, kv_len)
-            y = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=attn_mask, is_causal=False,
-            )
+            causal_mask = q_pos < kv_end.unsqueeze(0)  # (seqlen, kv_len), True = masked
+            attn_weights = attn_weights.masked_fill(causal_mask.unsqueeze(0).unsqueeze(0), float('-inf'))
+            attn_weights = F.softmax(attn_weights, dim=-1)
+            y = torch.matmul(attn_weights, v)
         else:
             y = F.scaled_dot_product_attention(
                 q, k, v, attn_mask=None, is_causal=True,
