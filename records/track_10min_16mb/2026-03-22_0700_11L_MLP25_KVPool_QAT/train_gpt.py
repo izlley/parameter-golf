@@ -581,6 +581,11 @@ class CausalSelfAttention(nn.Module):
             # Reshape and mean-pool: (bsz, heads, kv_len, stride, dim) -> (bsz, heads, kv_len, dim)
             k = k[:, :, :kv_len * s].reshape(bsz, self.num_kv_heads, kv_len, s, self.head_dim).mean(dim=3)
             v = v[:, :, :kv_len * s].reshape(bsz, self.num_kv_heads, kv_len, s, self.head_dim).mean(dim=3)
+            # Expand GQA heads: custom attn_mask + enable_gqa is not supported by SDPA backends
+            if self.num_kv_heads != self.num_heads:
+                repeat = self.num_heads // self.num_kv_heads
+                k = k[:, :, None, :, :].expand(-1, -1, repeat, -1, -1).reshape(bsz, self.num_heads, kv_len, self.head_dim)
+                v = v[:, :, None, :, :].expand(-1, -1, repeat, -1, -1).reshape(bsz, self.num_heads, kv_len, self.head_dim)
             # Causal mask: query at position i can attend to pooled position j
             # where j covers original positions [j*s, (j+1)*s - 1]
             # Allow if (j+1)*s - 1 <= i, i.e., j <= (i - s + 1) / s
@@ -590,7 +595,6 @@ class CausalSelfAttention(nn.Module):
             attn_mask = q_pos >= kv_end.unsqueeze(0)  # (seqlen, kv_len)
             y = F.scaled_dot_product_attention(
                 q, k, v, attn_mask=attn_mask, is_causal=False,
-                enable_gqa=(self.num_kv_heads != self.num_heads),
             )
         else:
             y = F.scaled_dot_product_attention(
