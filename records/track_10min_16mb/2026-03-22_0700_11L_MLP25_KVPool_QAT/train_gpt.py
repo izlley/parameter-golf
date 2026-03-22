@@ -575,12 +575,14 @@ class CausalSelfAttention(nn.Module):
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
 
         if self.kv_pool_stride > 1:
-            # Pool K, V along sequence dimension: (bsz, heads, seqlen, dim) -> (bsz, heads, seqlen//stride, dim)
+            # Causal mean pooling: average each position with its predecessor (no future leakage)
+            # pool[j] = mean(k[2j], k[2j-1]) for j>0, pool[0] = k[0]
             s = self.kv_pool_stride
-            kv_len = seqlen // s
-            # Reshape and mean-pool: (bsz, heads, kv_len, stride, dim) -> (bsz, heads, kv_len, dim)
-            k = k[:, :, :kv_len * s].reshape(bsz, self.num_kv_heads, kv_len, s, self.head_dim).mean(dim=3)
-            v = v[:, :, :kv_len * s].reshape(bsz, self.num_kv_heads, kv_len, s, self.head_dim).mean(dim=3)
+            k_prev = torch.cat([k[:, :, :1], k[:, :, :-1]], dim=2)  # shift right, repeat pos 0
+            v_prev = torch.cat([v[:, :, :1], v[:, :, :-1]], dim=2)
+            k = ((k + k_prev) * 0.5)[:, :, ::s].contiguous()  # causal avg then stride
+            v = ((v + v_prev) * 0.5)[:, :, ::s].contiguous()
+            kv_len = k.shape[2]
             # Expand GQA heads: custom attn_mask + enable_gqa is not supported by SDPA backends
             if self.num_kv_heads != self.num_heads:
                 repeat = self.num_heads // self.num_kv_heads
@@ -589,12 +591,11 @@ class CausalSelfAttention(nn.Module):
             # Manual attention: SDPA doesn't support asymmetric Q/KV lengths with masks in compile mode
             scale = 1.0 / math.sqrt(self.head_dim)
             attn_weights = torch.matmul(q, k.transpose(-2, -1)) * scale  # (bsz, heads, seqlen, kv_len)
-            # Causal mask: query at position i can attend to pooled position j
-            # where j covers original positions [j*s, (j+1)*s - 1]
-            # Allow if j*s <= i (pooled group's start position <= query position)
+            # Causal mask: strided position j corresponds to original position j*s
+            # query at position i can attend if j*s <= i
             q_pos = torch.arange(seqlen, device=x.device).unsqueeze(1)  # (seqlen, 1)
-            kv_start = torch.arange(kv_len, device=x.device) * s  # (kv_len,)
-            causal_mask = q_pos < kv_start.unsqueeze(0)  # (seqlen, kv_len), True = masked
+            kv_orig_pos = torch.arange(kv_len, device=x.device) * s  # (kv_len,)
+            causal_mask = q_pos < kv_orig_pos.unsqueeze(0)  # (seqlen, kv_len), True = masked
             attn_weights = attn_weights.masked_fill(causal_mask.unsqueeze(0).unsqueeze(0), float('-inf'))
             attn_weights = F.softmax(attn_weights, dim=-1)
             y = torch.matmul(attn_weights, v)
