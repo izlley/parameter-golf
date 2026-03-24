@@ -24,7 +24,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 try:
-    from flash_attn_interface import flash_attn_func as _fa3_func
+    from flash_attn.flash_attn_interface import flash_attn_func as _fa3_func
     _USE_FA3 = True
 except ImportError:
     _USE_FA3 = False
