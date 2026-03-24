@@ -1081,8 +1081,11 @@ def eval_val_sliding(
     byte_count = torch.zeros((), device=device, dtype=torch.float64)
     base_model.eval()
     compiled_logits = torch.compile(base_model.forward_logits, dynamic=False, fullgraph=True)
+    total_batches = (len(my_windows) + batch_seqs - 1) // batch_seqs
     with torch.inference_mode():
-        for bi in range(0, len(my_windows), batch_seqs):
+        for bi_idx, bi in enumerate(range(0, len(my_windows), batch_seqs)):
+            if rank == 0 and bi_idx % 20 == 0:
+                print(f"  eval_sliding: batch {bi_idx+1}/{total_batches} ({100*bi_idx/max(total_batches,1):.0f}%)", flush=True)
             batch_ws = my_windows[bi:bi + batch_seqs]
             bsz = len(batch_ws)
             x_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
