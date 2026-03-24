@@ -1254,9 +1254,6 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
-    swa_state: dict[str, Tensor] | None = None
-    swa_count = 0
-    swa_weight_sum = 0.0
     ema_state = {name: t.detach().float().clone() for name, t in base_model.state_dict().items()}
     ema_decay = 0.997
     training_time_ms = 0.0
@@ -1333,17 +1330,6 @@ def main() -> None:
                 ema_state[name].mul_(ema_decay).add_(t.detach().float(), alpha=1.0 - ema_decay)
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
-        if args.swa_enabled and scale < 0.2 and step % args.swa_every == 0:
-            swa_count += 1
-            w = float(swa_count)
-            swa_weight_sum += w
-            if swa_state is None:
-                swa_state = {name: w * t.detach().cpu().float().clone() for name, t in base_model.state_dict().items()}
-                log0(f"swa:start step:{step} weight:{w}")
-            else:
-                for name, t in base_model.state_dict().items():
-                    swa_state[name] += w * t.detach().cpu().float()
-                log0(f"swa:collect step:{step} count:{swa_count} weight:{w}")
         should_log_train = (
             args.train_log_every > 0
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
@@ -1364,17 +1350,10 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-    # Blend EMA + Weighted SWA
+    # Apply EMA weights only (Weighted SWA showed no benefit in Exp 74)
     current_state = base_model.state_dict()
-    if swa_state is not None and swa_weight_sum > 0:
-        swa_avg = {name: (t / swa_weight_sum).to(device=current_state[name].device, dtype=current_state[name].dtype) for name, t in swa_state.items()}
-        ema_avg = {name: t.to(device=current_state[name].device, dtype=current_state[name].dtype) for name, t in ema_state.items()}
-        blend_alpha = 0.5
-        avg_state = {name: blend_alpha * ema_avg[name] + (1 - blend_alpha) * swa_avg[name] for name in current_state}
-        log0(f"blend:EMA({blend_alpha})+WeightedSWA({1-blend_alpha}) swa_count:{swa_count} swa_weight_sum:{swa_weight_sum}")
-    else:
-        avg_state = {name: t.to(dtype=current_state[name].dtype) for name, t in ema_state.items()}
-        log0("ema:applying EMA weights only (no SWA)")
+    avg_state = {name: t.to(device=current_state[name].device, dtype=current_state[name].dtype) for name, t in ema_state.items()}
+    log0("ema:applying EMA weights")
     base_model.load_state_dict(avg_state, strict=True)
     torch.cuda.synchronize()
     t_diag = time.perf_counter()
@@ -1384,7 +1363,7 @@ def main() -> None:
     )
     torch.cuda.synchronize()
     log0(
-        f"DIAGNOSTIC post_blend val_loss:{diag_val_loss:.4f} val_bpb:{diag_val_bpb:.4f} "
+        f"DIAGNOSTIC post_ema val_loss:{diag_val_loss:.4f} val_bpb:{diag_val_bpb:.4f} "
         f"eval_time:{1000.0 * (time.perf_counter() - t_diag):.0f}ms"
     )
     full_state_dict = base_model.state_dict()
