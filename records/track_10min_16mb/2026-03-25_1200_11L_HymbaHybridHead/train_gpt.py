@@ -1174,6 +1174,7 @@ def dequantize_mixed_int6(result: dict[str, Tensor], meta: dict[str, object],
         s = result.get(name + ".scale")
         if q is None or s is None:
             # Fallback: key exists in meta but not in result (e.g. shape mismatch)
+            print(f"WARNING dequantize: missing q/scale for {name}, q={q is not None} s={s is not None}")
             if name in result:
                 out[name] = result[name].to(orig_dtype)
             continue
