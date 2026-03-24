@@ -1118,6 +1118,9 @@ def quantize_int6_per_row(t: Tensor, clip_range: int = 31) -> tuple[Tensor, Tens
             err = (t32 - recon).pow(2).mean().item()
             if err < best_err:
                 best_q, best_s, best_err = q, s, err
+        if best_q is None:
+            # Fallback: use last computed q, s
+            best_q, best_s = q, s
         return best_q, best_s
     amax = t32.abs().max().item()
     scale = torch.tensor(amax / clip_range if amax > 0 else 1.0, dtype=torch.float16)
@@ -1167,7 +1170,13 @@ def dequantize_mixed_int6(result: dict[str, Tensor], meta: dict[str, object],
                 t = t.to(orig_dtype)
             out[name] = t
             continue
-        q, s = result[name + ".q"], result[name + ".scale"]
+        q = result.get(name + ".q")
+        s = result.get(name + ".scale")
+        if q is None or s is None:
+            # Fallback: key exists in meta but not in result (e.g. shape mismatch)
+            if name in result:
+                out[name] = result[name].to(orig_dtype)
+            continue
         if s.ndim > 0:
             out[name] = (q.float() * s.float().view(q.shape[0], *([1] * (q.ndim - 1)))).to(orig_dtype)
         else:

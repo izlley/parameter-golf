@@ -914,7 +914,7 @@ def measure_block_influence(
             start = s * seq_len
             if start + seq_len + 1 > val_tokens.numel():
                 break
-            input_ids = val_tokens[start:start + seq_len].unsqueeze(0).to(device)
+            input_ids = val_tokens[start:start + seq_len].unsqueeze(0).to(device).long()
 
             # Forward pass, collecting hidden states before/after each block
             x = model.tok_emb(input_ids)
