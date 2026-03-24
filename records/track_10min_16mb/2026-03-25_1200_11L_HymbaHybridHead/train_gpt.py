@@ -519,30 +519,57 @@ class SSMHead(nn.Module):
         self.out_gate = nn.Linear(ssm_dim, ssm_dim, bias=False)
         nn.init.ones_(self.out_gate.weight)
 
-    def _parallel_scan(self, x_conv: Tensor, dA: Tensor, dB: Tensor, C_t: Tensor) -> Tensor:
-        """Parallel-friendly SSM using associative scan via cumsum.
+    def _chunked_scan(self, x_conv: Tensor, dA: Tensor, dB: Tensor, C_t: Tensor,
+                      chunk_size: int = 64) -> Tensor:
+        """Numerically stable chunked SSM scan.
+        Within each chunk: use log-space cumsum (safe because chunk_size is small).
+        Across chunks: carry state via recurrence.
         x_conv: (B, T, D), dA: (B, T, N), dB: (B, T, N), C_t: (B, T, N)
         Returns: (B, T, D)
         """
-        # Compute input contributions: inp[t] = dB[t] * x_conv[t]  -> (B, T, D, N)
-        inp = x_conv.unsqueeze(-1) * dB.unsqueeze(2)  # (B, T, D, N)
+        B, T, D = x_conv.shape
+        N = dA.shape[-1]
 
-        # For parallel scan, use log-space cumsum of decay factors
-        log_dA = torch.log(dA.clamp_min(1e-6))  # (B, T, N)
-        log_dA_cumsum = torch.cumsum(log_dA, dim=1)  # (B, T, N)
+        outputs = []
+        h = torch.zeros(B, D, N, device=x_conv.device, dtype=x_conv.dtype)
 
-        # Weighted input: exp(-cumsum) * inp, then cumsum, then apply forward decay
-        decay_weights = torch.exp(-log_dA_cumsum).unsqueeze(2)  # (B, T, 1, N)
-        weighted_inp = decay_weights * inp  # (B, T, D, N)
-        weighted_inp_cumsum = torch.cumsum(weighted_inp, dim=1)  # (B, T, D, N)
+        for t0 in range(0, T, chunk_size):
+            t1 = min(t0 + chunk_size, T)
 
-        # Apply forward decay to get h[t]
-        forward_decay = torch.exp(log_dA_cumsum).unsqueeze(2)  # (B, T, 1, N)
-        h_all = forward_decay * weighted_inp_cumsum  # (B, T, D, N)
+            dA_c = dA[:, t0:t1]      # (B, L, N)
+            dB_c = dB[:, t0:t1]      # (B, L, N)
+            x_c = x_conv[:, t0:t1]   # (B, L, D)
+            C_c = C_t[:, t0:t1]      # (B, L, N)
 
-        # Output: y[t] = sum_n C[t,n] * h[t,:,n]
-        y = (h_all * C_t.unsqueeze(2)).sum(-1)  # (B, T, D)
-        return y
+            # --- intra-chunk via log-space (small L, no overflow) ---
+            log_dA_c = torch.log(dA_c.clamp_min(1e-8))       # (B, L, N)
+            log_dA_cum = torch.cumsum(log_dA_c, dim=1)        # (B, L, N)
+
+            # Input contribution: inp[t] = dB[t] * x[t]
+            inp = x_c.unsqueeze(-1) * dB_c.unsqueeze(2)       # (B, L, D, N)
+
+            # Normalize by cumulative decay for stable cumsum
+            inv_decay = torch.exp(-log_dA_cum).unsqueeze(2)    # (B, L, 1, N)
+            normed_inp = inv_decay * inp                       # (B, L, D, N)
+            normed_cumsum = torch.cumsum(normed_inp, dim=1)    # (B, L, D, N)
+
+            # Re-apply forward decay
+            fwd_decay = torch.exp(log_dA_cum).unsqueeze(2)     # (B, L, 1, N)
+            h_intra = fwd_decay * normed_cumsum                # (B, L, D, N)
+
+            # --- inter-chunk: add carried state h ---
+            # h contributes h * cumulative_decay_from_chunk_start
+            h_contrib = h.unsqueeze(1) * fwd_decay             # (B, L, D, N)
+            h_total = h_intra + h_contrib                      # (B, L, D, N)
+
+            # Output: y[t] = sum_n C[t,n] * h_total[t,:,n]
+            y_chunk = (h_total * C_c.unsqueeze(2)).sum(-1)     # (B, L, D)
+            outputs.append(y_chunk)
+
+            # Update state: h = h_total at last timestep
+            h = h_total[:, -1]  # (B, D, N)
+
+        return torch.cat(outputs, dim=1)  # (B, T, D)
 
     def forward(self, x: Tensor) -> Tensor:
         """x: (batch, seq_len, ssm_dim) -> (batch, seq_len, ssm_dim)"""
@@ -564,8 +591,8 @@ class SSMHead(nn.Module):
         dA = torch.exp(A[None, None, :] * dt)  # (B, T, d_state)
         dB = dt * B_t  # (B, T, d_state)
 
-        # Parallel scan
-        y = self._parallel_scan(x_conv, dA, dB, C_t)
+        # Chunked scan (numerically stable)
+        y = self._chunked_scan(x_conv, dA, dB, C_t)
 
         # Add skip connection with D parameter
         y = y + self.D[None, None, :] * x_conv
