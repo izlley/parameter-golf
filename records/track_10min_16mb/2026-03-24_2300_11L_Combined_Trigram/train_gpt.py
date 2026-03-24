@@ -24,7 +24,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 try:
-    from flash_attn_interface import flash_attn_func as _fa3_func
+    from flash_attn.flash_attn_interface import flash_attn_func as _fa3_func
     _USE_FA3 = True
 except ImportError:
     _USE_FA3 = False
@@ -1363,8 +1363,8 @@ def main() -> None:
     # Blend EMA + Weighted SWA
     current_state = base_model.state_dict()
     if swa_state is not None and swa_weight_sum > 0:
-        swa_avg = {name: (t / swa_weight_sum).to(dtype=current_state[name].dtype) for name, t in swa_state.items()}
-        ema_avg = {name: t.to(dtype=current_state[name].dtype) for name, t in ema_state.items()}
+        swa_avg = {name: (t / swa_weight_sum).to(device=current_state[name].device, dtype=current_state[name].dtype) for name, t in swa_state.items()}
+        ema_avg = {name: t.to(device=current_state[name].device, dtype=current_state[name].dtype) for name, t in ema_state.items()}
         blend_alpha = 0.5
         avg_state = {name: blend_alpha * ema_avg[name] + (1 - blend_alpha) * swa_avg[name] for name in current_state}
         log0(f"blend:EMA({blend_alpha})+WeightedSWA({1-blend_alpha}) swa_count:{swa_count} swa_weight_sum:{swa_weight_sum}")
