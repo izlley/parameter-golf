@@ -706,11 +706,11 @@ class GPT(nn.Module):
                 nn.Parameter(torch.ones(model_dim, dtype=torch.float32))
                 for _ in range(num_pred_heads)
             ])
-            # Learnable ensemble weights: main + num_pred_heads aux
+            # Ensemble weights: fixed buffer (eval-only, not trained)
             num_total = num_pred_heads + 1
             init_w = torch.zeros(num_total)
             init_w[-1] = 1.0  # bias toward main
-            self.head_logit_weights = nn.Parameter(init_w)
+            self.register_buffer("head_logit_weights", init_w)
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -1017,7 +1017,6 @@ def main() -> None:
     if base_model.num_pred_heads > 0:
         for hs in base_model.head_scales:
             scalar_params.append(hs)
-        scalar_params.append(base_model.head_logit_weights)
 
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     tok_params = [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}]
@@ -1110,7 +1109,7 @@ def main() -> None:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    warmup_loss = model(x, y)
+                    warmup_loss = model(x, y, aux_loss_weight=args.aux_loss_weight)
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
                 opt.step()

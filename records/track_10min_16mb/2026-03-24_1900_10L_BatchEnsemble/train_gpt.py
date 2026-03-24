@@ -696,16 +696,15 @@ class GPT(nn.Module):
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
-        # BatchEnsemble: rank-1 perturbation vectors per decoder layer per member
+        # BatchEnsemble: rank-1 perturbation vectors per decoder layer per member (eval-only)
         self.num_ensemble_members = num_ensemble_members
         if num_ensemble_members > 0:
             # r_i vectors: input-side perturbation for each member, each decoder layer
             # Shape: [num_members, num_decoder_layers, model_dim]
-            self.ensemble_r = nn.Parameter(
-                torch.ones(num_ensemble_members, self.num_decoder_layers, model_dim, dtype=torch.float32)
-            )
-            # Small random init around 1.0 for diversity
-            nn.init.normal_(self.ensemble_r, mean=1.0, std=0.02)
+            # Buffer (not Parameter) since these are eval-only and not trained
+            ensemble_r = torch.ones(num_ensemble_members, self.num_decoder_layers, model_dim, dtype=torch.float32)
+            nn.init.normal_(ensemble_r, mean=1.0, std=0.02)
+            self.register_buffer("ensemble_r", ensemble_r)
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -1007,9 +1006,6 @@ def main() -> None:
     scalar_params.append(base_model.smear.gate)
     if base_model.bigram is not None:
         scalar_params.append(base_model.bigram.scale)
-    if base_model.num_ensemble_members > 0:
-        scalar_params.append(base_model.ensemble_r)
-
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     tok_params = [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}]
     if base_model.bigram is not None:
