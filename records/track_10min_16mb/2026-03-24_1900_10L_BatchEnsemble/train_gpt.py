@@ -101,9 +101,8 @@ class Hyperparameters:
 
     qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "1")))
 
-    # Multi-Exit V2: exits at last decoder layers with learnable weighted avg
-    exit_decoder_indices: str = os.environ.get("EXIT_DECODER_INDICES", "2,3")  # decoder layer indices (0-based)
-    aux_loss_weight: float = float(os.environ.get("AUX_LOSS_WEIGHT", 0.1))
+    # BatchEnsemble: number of extra ensemble members (0 = disabled)
+    num_ensemble_members: int = int(os.environ.get("NUM_ENSEMBLE_MEMBERS", 2))
 
 
 # -----------------------------
@@ -289,7 +288,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear,bigram.scale",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear,bigram.scale,ensemble_r",
     ).split(",")
     if pattern
 )
@@ -672,7 +671,7 @@ class GPT(nn.Module):
         qk_gain_init: float,
         bigram_vocab_size: int = 0,
         bigram_dim: int = 128,
-        exit_decoder_indices: list[int] | None = None,
+        num_ensemble_members: int = 0,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -697,13 +696,16 @@ class GPT(nn.Module):
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
-        # Multi-Exit V2 (eval-only): reuse final_norm for all exits (full weight tying)
-        self.exit_decoder_indices = exit_decoder_indices or []
-        num_exits = len(self.exit_decoder_indices) + 1  # aux exits + main
-        # Fixed weights: higher weight for later exits
-        self.register_buffer("exit_logit_weights", torch.tensor(
-            [1.0 / (num_exits - i) for i in range(num_exits)]  # e.g., [0.33, 0.5, 1.0]
-        ))
+        # BatchEnsemble: rank-1 perturbation vectors per decoder layer per member
+        self.num_ensemble_members = num_ensemble_members
+        if num_ensemble_members > 0:
+            # r_i vectors: input-side perturbation for each member, each decoder layer
+            # Shape: [num_members, num_decoder_layers, model_dim]
+            self.ensemble_r = nn.Parameter(
+                torch.ones(num_ensemble_members, self.num_decoder_layers, model_dim, dtype=torch.float32)
+            )
+            # Small random init around 1.0 for diversity
+            nn.init.normal_(self.ensemble_r, mean=1.0, std=0.02)
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -721,17 +723,27 @@ class GPT(nn.Module):
                             module.weight.mul_(1.0 / math.sqrt(2 * num_layers))
 
     def _project_logits(self, h: Tensor) -> Tensor:
-        """Project hidden states to logits with softcap."""
         if self.tie_embeddings:
-            logits_proj = F.linear(h, self.tok_emb.weight)
+            proj = F.linear(h, self.tok_emb.weight)
         else:
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
-            logits_proj = self.lm_head(h)
-        return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+            proj = self.lm_head(h)
+        return self.logit_softcap * torch.tanh(proj / self.logit_softcap)
+
+    def _run_decoder(self, x: Tensor, x0: Tensor, skips: list[Tensor],
+                     member_idx: int = -1) -> Tensor:
+        """Run decoder layers. If member_idx >= 0, apply rank-1 perturbation."""
+        for i in range(self.num_decoder_layers):
+            if skips:
+                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            if member_idx >= 0:
+                r = self.ensemble_r[member_idx, i].to(dtype=x.dtype)[None, None, :]
+                x = x * r
+            x = self.blocks[self.num_encoder_layers + i](x, x0)
+        return x
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        """Training: standard forward, NO auxiliary loss (eval-only ensemble)."""
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
             x = x + self.bigram(input_ids)
@@ -742,17 +754,14 @@ class GPT(nn.Module):
         for i in range(self.num_encoder_layers):
             x = self.blocks[i](x, x0)
             skips.append(x)
-        for i in range(self.num_decoder_layers):
-            if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
-        x = self.final_norm(x).reshape(-1, x.size(-1))
+        # Training: standard path (no perturbation). Ensemble is eval-only.
+        x = self._run_decoder(x, x0, skips, member_idx=-1)
+        h = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
-        main_logits = self._project_logits(x)
-        return F.cross_entropy(main_logits.float(), targets, reduction="mean")
+        logits = self._project_logits(h)
+        return F.cross_entropy(logits.float(), targets, reduction="mean")
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
-        """Eval: weighted ensemble of logits from last N decoder layers + main."""
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
             x = x + self.bigram(input_ids)
@@ -763,20 +772,20 @@ class GPT(nn.Module):
         for i in range(self.num_encoder_layers):
             x = self.blocks[i](x, x0)
             skips.append(x)
-        all_logits: list[Tensor] = []
-        for i in range(self.num_decoder_layers):
-            if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
-            if i in self.exit_decoder_indices:
-                # Reuse final_norm for all exits (full weight tying)
-                all_logits.append(self._project_logits(self.final_norm(x)))
-        # Main exit
-        all_logits.append(self._project_logits(self.final_norm(x)))
-        # Weighted average (normalized)
-        w = self.exit_logit_weights / self.exit_logit_weights.sum()
-        logits = sum(w[i] * all_logits[i] for i in range(len(all_logits)))
-        return logits
+        # Save encoder state for reuse across ensemble members
+        x_enc = x.clone()
+        skips_orig = [s.clone() for s in skips]
+        # Main (unperturbed) path
+        main_x = self._run_decoder(x_enc.clone(), x0, [s.clone() for s in skips_orig], member_idx=-1)
+        main_logits = self._project_logits(self.final_norm(main_x))
+        if self.num_ensemble_members == 0:
+            return main_logits
+        # Ensemble: average main + all perturbed members
+        all_logits = [main_logits]
+        for m in range(self.num_ensemble_members):
+            m_x = self._run_decoder(x_enc.clone(), x0, [s.clone() for s in skips_orig], member_idx=m)
+            all_logits.append(self._project_logits(self.final_norm(m_x)))
+        return sum(all_logits) / len(all_logits)
 
 
 def eval_val_sliding(
@@ -951,9 +960,6 @@ def main() -> None:
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
 
     # MODEL + OPTIMIZER SETUP
-    exit_decoder_indices = [int(x) for x in args.exit_decoder_indices.split(",") if x.strip()]
-    log0(f"multi_exit_v2:decoder_indices={exit_decoder_indices} aux_loss_weight={args.aux_loss_weight}")
-
     base_model = GPT(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
@@ -968,7 +974,7 @@ def main() -> None:
         qk_gain_init=args.qk_gain_init,
         bigram_vocab_size=args.bigram_vocab_size,
         bigram_dim=args.bigram_dim,
-        exit_decoder_indices=exit_decoder_indices,
+        num_ensemble_members=args.num_ensemble_members,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1001,6 +1007,8 @@ def main() -> None:
     scalar_params.append(base_model.smear.gate)
     if base_model.bigram is not None:
         scalar_params.append(base_model.bigram.scale)
+    if base_model.num_ensemble_members > 0:
+        scalar_params.append(base_model.ensemble_r)
 
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     tok_params = [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}]
@@ -1113,6 +1121,7 @@ def main() -> None:
     stop_after_step: int | None = None
     swa_state: dict[str, Tensor] | None = None
     swa_count = 0
+    swa_weight_sum = 0.0  # weighted SWA: linear increasing weights
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1177,16 +1186,18 @@ def main() -> None:
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
 
-        # SWA: collect checkpoints during warmdown
+        # Weighted SWA: collect checkpoints with linear increasing weights
         if args.swa_enabled and scale < args.swa_start_frac and step % args.swa_every == 0:
+            swa_count += 1
+            w = float(swa_count)  # linear weight: 1, 2, 3, ...
+            swa_weight_sum += w
             if swa_state is None:
-                swa_state = {name: t.detach().cpu().clone() for name, t in base_model.state_dict().items()}
-                swa_count = 1
-                log0(f"swa:start step:{step}")
+                swa_state = {name: w * t.detach().cpu().clone() for name, t in base_model.state_dict().items()}
+                log0(f"swa:start step:{step} weight:{w}")
             else:
                 for name, t in base_model.state_dict().items():
-                    swa_state[name] += t.detach().cpu()
-                swa_count += 1
+                    swa_state[name] += w * t.detach().cpu()
+                log0(f"swa:collect step:{step} weight:{w} count:{swa_count}")
 
         should_log_train = (
             args.train_log_every > 0
@@ -1214,12 +1225,12 @@ def main() -> None:
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
 
-    # Apply SWA if collected
+    # Apply Weighted SWA if collected
     if args.swa_enabled and swa_state is not None and swa_count > 1:
-        log0(f"swa:applying averaged {swa_count} checkpoints")
+        log0(f"swa:applying weighted average {swa_count} checkpoints weight_sum:{swa_weight_sum}")
         current_state = base_model.state_dict()
         avg_state = {
-            name: (tensor / swa_count).to(dtype=current_state[name].dtype)
+            name: (tensor / swa_weight_sum).to(dtype=current_state[name].dtype)
             for name, tensor in swa_state.items()
         }
         base_model.load_state_dict(avg_state, strict=True)

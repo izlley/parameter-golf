@@ -101,8 +101,8 @@ class Hyperparameters:
 
     qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "1")))
 
-    # Multi-Exit V2: exits at last decoder layers with learnable weighted avg
-    exit_decoder_indices: str = os.environ.get("EXIT_DECODER_INDICES", "2,3")  # decoder layer indices (0-based)
+    # Multi-Head Scaled Views: number of auxiliary prediction heads
+    num_pred_heads: int = int(os.environ.get("NUM_PRED_HEADS", 2))
     aux_loss_weight: float = float(os.environ.get("AUX_LOSS_WEIGHT", 0.1))
 
 
@@ -289,7 +289,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear,bigram.scale",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear,bigram.scale,head_scales,head_logit_weights",
     ).split(",")
     if pattern
 )
@@ -672,7 +672,7 @@ class GPT(nn.Module):
         qk_gain_init: float,
         bigram_vocab_size: int = 0,
         bigram_dim: int = 128,
-        exit_decoder_indices: list[int] | None = None,
+        num_pred_heads: int = 0,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -697,13 +697,20 @@ class GPT(nn.Module):
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
-        # Multi-Exit V2 (eval-only): reuse final_norm for all exits (full weight tying)
-        self.exit_decoder_indices = exit_decoder_indices or []
-        num_exits = len(self.exit_decoder_indices) + 1  # aux exits + main
-        # Fixed weights: higher weight for later exits
-        self.register_buffer("exit_logit_weights", torch.tensor(
-            [1.0 / (num_exits - i) for i in range(num_exits)]  # e.g., [0.33, 0.5, 1.0]
-        ))
+        # Multi-Head Scaled Views: each head = scaling vector on final hidden state
+        # All heads share tok_emb.weight projection (full weight tying)
+        self.num_pred_heads = num_pred_heads
+        if num_pred_heads > 0:
+            # Each head: a learnable dim-sized scaling vector (element-wise multiply)
+            self.head_scales = nn.ParameterList([
+                nn.Parameter(torch.ones(model_dim, dtype=torch.float32))
+                for _ in range(num_pred_heads)
+            ])
+            # Learnable ensemble weights: main + num_pred_heads aux
+            num_total = num_pred_heads + 1
+            init_w = torch.zeros(num_total)
+            init_w[-1] = 1.0  # bias toward main
+            self.head_logit_weights = nn.Parameter(init_w)
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -721,17 +728,15 @@ class GPT(nn.Module):
                             module.weight.mul_(1.0 / math.sqrt(2 * num_layers))
 
     def _project_logits(self, h: Tensor) -> Tensor:
-        """Project hidden states to logits with softcap."""
         if self.tie_embeddings:
-            logits_proj = F.linear(h, self.tok_emb.weight)
+            proj = F.linear(h, self.tok_emb.weight)
         else:
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
-            logits_proj = self.lm_head(h)
-        return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+            proj = self.lm_head(h)
+        return self.logit_softcap * torch.tanh(proj / self.logit_softcap)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        """Training: standard forward, NO auxiliary loss (eval-only ensemble)."""
+    def forward(self, input_ids: Tensor, target_ids: Tensor, aux_loss_weight: float = 0.0) -> Tensor:
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
             x = x + self.bigram(input_ids)
@@ -746,13 +751,22 @@ class GPT(nn.Module):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
-        x = self.final_norm(x).reshape(-1, x.size(-1))
+        h = self.final_norm(x)
+        h_flat = h.reshape(-1, h.size(-1))
         targets = target_ids.reshape(-1)
-        main_logits = self._project_logits(x)
-        return F.cross_entropy(main_logits.float(), targets, reduction="mean")
+        main_logits = self._project_logits(h_flat)
+        loss = F.cross_entropy(main_logits.float(), targets, reduction="mean")
+        # Multi-head auxiliary losses (scaled views of the same hidden state)
+        if self.num_pred_heads > 0 and aux_loss_weight > 0.0:
+            aux_losses = []
+            for k in range(self.num_pred_heads):
+                h_scaled = h_flat * self.head_scales[k].to(dtype=h_flat.dtype)
+                head_logits = self._project_logits(h_scaled)
+                aux_losses.append(F.cross_entropy(head_logits.float(), targets, reduction="mean"))
+            loss = loss + aux_loss_weight * sum(aux_losses) / len(aux_losses)
+        return loss
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
-        """Eval: weighted ensemble of logits from last N decoder layers + main."""
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
             x = x + self.bigram(input_ids)
@@ -763,20 +777,22 @@ class GPT(nn.Module):
         for i in range(self.num_encoder_layers):
             x = self.blocks[i](x, x0)
             skips.append(x)
-        all_logits: list[Tensor] = []
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
-            if i in self.exit_decoder_indices:
-                # Reuse final_norm for all exits (full weight tying)
-                all_logits.append(self._project_logits(self.final_norm(x)))
-        # Main exit
-        all_logits.append(self._project_logits(self.final_norm(x)))
-        # Weighted average (normalized)
-        w = self.exit_logit_weights / self.exit_logit_weights.sum()
-        logits = sum(w[i] * all_logits[i] for i in range(len(all_logits)))
-        return logits
+        h = self.final_norm(x)
+        main_logits = self._project_logits(h)
+        if self.num_pred_heads > 0:
+            w = F.softmax(self.head_logit_weights.float(), dim=0)
+            # Aux heads: scaled views
+            all_logits = []
+            for k in range(self.num_pred_heads):
+                h_scaled = h * self.head_scales[k].to(dtype=h.dtype)
+                all_logits.append(self._project_logits(h_scaled))
+            all_logits.append(main_logits)
+            return sum(w[i] * all_logits[i] for i in range(len(all_logits)))
+        return main_logits
 
 
 def eval_val_sliding(
@@ -951,9 +967,6 @@ def main() -> None:
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
 
     # MODEL + OPTIMIZER SETUP
-    exit_decoder_indices = [int(x) for x in args.exit_decoder_indices.split(",") if x.strip()]
-    log0(f"multi_exit_v2:decoder_indices={exit_decoder_indices} aux_loss_weight={args.aux_loss_weight}")
-
     base_model = GPT(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
@@ -968,7 +981,7 @@ def main() -> None:
         qk_gain_init=args.qk_gain_init,
         bigram_vocab_size=args.bigram_vocab_size,
         bigram_dim=args.bigram_dim,
-        exit_decoder_indices=exit_decoder_indices,
+        num_pred_heads=args.num_pred_heads,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1001,6 +1014,10 @@ def main() -> None:
     scalar_params.append(base_model.smear.gate)
     if base_model.bigram is not None:
         scalar_params.append(base_model.bigram.scale)
+    if base_model.num_pred_heads > 0:
+        for hs in base_model.head_scales:
+            scalar_params.append(hs)
+        scalar_params.append(base_model.head_logit_weights)
 
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     tok_params = [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}]
@@ -1113,6 +1130,7 @@ def main() -> None:
     stop_after_step: int | None = None
     swa_state: dict[str, Tensor] | None = None
     swa_count = 0
+    swa_weight_sum = 0.0  # weighted SWA: linear increasing weights
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1154,7 +1172,7 @@ def main() -> None:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss = model(x, y)
+                loss = model(x, y, aux_loss_weight=args.aux_loss_weight)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
@@ -1177,16 +1195,18 @@ def main() -> None:
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
 
-        # SWA: collect checkpoints during warmdown
+        # Weighted SWA: collect checkpoints with linear increasing weights
         if args.swa_enabled and scale < args.swa_start_frac and step % args.swa_every == 0:
+            swa_count += 1
+            w = float(swa_count)  # linear weight: 1, 2, 3, ...
+            swa_weight_sum += w
             if swa_state is None:
-                swa_state = {name: t.detach().cpu().clone() for name, t in base_model.state_dict().items()}
-                swa_count = 1
-                log0(f"swa:start step:{step}")
+                swa_state = {name: w * t.detach().cpu().clone() for name, t in base_model.state_dict().items()}
+                log0(f"swa:start step:{step} weight:{w}")
             else:
                 for name, t in base_model.state_dict().items():
-                    swa_state[name] += t.detach().cpu()
-                swa_count += 1
+                    swa_state[name] += w * t.detach().cpu()
+                log0(f"swa:collect step:{step} weight:{w} count:{swa_count}")
 
         should_log_train = (
             args.train_log_every > 0
@@ -1214,12 +1234,12 @@ def main() -> None:
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
 
-    # Apply SWA if collected
+    # Apply Weighted SWA if collected
     if args.swa_enabled and swa_state is not None and swa_count > 1:
-        log0(f"swa:applying averaged {swa_count} checkpoints")
+        log0(f"swa:applying weighted average {swa_count} checkpoints weight_sum:{swa_weight_sum}")
         current_state = base_model.state_dict()
         avg_state = {
-            name: (tensor / swa_count).to(dtype=current_state[name].dtype)
+            name: (tensor / swa_weight_sum).to(dtype=current_state[name].dtype)
             for name, tensor in swa_state.items()
         }
         base_model.load_state_dict(avg_state, strict=True)

@@ -101,10 +101,6 @@ class Hyperparameters:
 
     qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "1")))
 
-    # Multi-Exit V2: exits at last decoder layers with learnable weighted avg
-    exit_decoder_indices: str = os.environ.get("EXIT_DECODER_INDICES", "2,3")  # decoder layer indices (0-based)
-    aux_loss_weight: float = float(os.environ.get("AUX_LOSS_WEIGHT", 0.1))
-
 
 # -----------------------------
 # MUON OPTIMIZER
@@ -672,7 +668,6 @@ class GPT(nn.Module):
         qk_gain_init: float,
         bigram_vocab_size: int = 0,
         bigram_dim: int = 128,
-        exit_decoder_indices: list[int] | None = None,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -697,13 +692,6 @@ class GPT(nn.Module):
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
-        # Multi-Exit V2 (eval-only): reuse final_norm for all exits (full weight tying)
-        self.exit_decoder_indices = exit_decoder_indices or []
-        num_exits = len(self.exit_decoder_indices) + 1  # aux exits + main
-        # Fixed weights: higher weight for later exits
-        self.register_buffer("exit_logit_weights", torch.tensor(
-            [1.0 / (num_exits - i) for i in range(num_exits)]  # e.g., [0.33, 0.5, 1.0]
-        ))
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -720,18 +708,7 @@ class GPT(nn.Module):
                         with torch.no_grad():
                             module.weight.mul_(1.0 / math.sqrt(2 * num_layers))
 
-    def _project_logits(self, h: Tensor) -> Tensor:
-        """Project hidden states to logits with softcap."""
-        if self.tie_embeddings:
-            logits_proj = F.linear(h, self.tok_emb.weight)
-        else:
-            if self.lm_head is None:
-                raise RuntimeError("lm_head is required when tie_embeddings=False")
-            logits_proj = self.lm_head(h)
-        return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        """Training: standard forward, NO auxiliary loss (eval-only ensemble)."""
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
             x = x + self.bigram(input_ids)
@@ -748,11 +725,16 @@ class GPT(nn.Module):
             x = self.blocks[self.num_encoder_layers + i](x, x0)
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
-        main_logits = self._project_logits(x)
-        return F.cross_entropy(main_logits.float(), targets, reduction="mean")
+        if self.tie_embeddings:
+            logits_proj = F.linear(x, self.tok_emb.weight)
+        else:
+            if self.lm_head is None:
+                raise RuntimeError("lm_head is required when tie_embeddings=False")
+            logits_proj = self.lm_head(x)
+        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+        return F.cross_entropy(logits.float(), targets, reduction="mean")
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
-        """Eval: weighted ensemble of logits from last N decoder layers + main."""
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
             x = x + self.bigram(input_ids)
@@ -763,20 +745,16 @@ class GPT(nn.Module):
         for i in range(self.num_encoder_layers):
             x = self.blocks[i](x, x0)
             skips.append(x)
-        all_logits: list[Tensor] = []
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
-            if i in self.exit_decoder_indices:
-                # Reuse final_norm for all exits (full weight tying)
-                all_logits.append(self._project_logits(self.final_norm(x)))
-        # Main exit
-        all_logits.append(self._project_logits(self.final_norm(x)))
-        # Weighted average (normalized)
-        w = self.exit_logit_weights / self.exit_logit_weights.sum()
-        logits = sum(w[i] * all_logits[i] for i in range(len(all_logits)))
-        return logits
+        x = self.final_norm(x)
+        if self.tie_embeddings:
+            logits_proj = F.linear(x, self.tok_emb.weight)
+        else:
+            logits_proj = self.lm_head(x)
+        return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
 
 def eval_val_sliding(
@@ -856,6 +834,92 @@ def eval_val_sliding(
     bits_per_token = val_loss / math.log(2.0)
     tokens_per_byte = token_count.item() / byte_count.item()
     base_model.train()
+    return val_loss, bits_per_token * tokens_per_byte
+
+
+def eval_val_sliding_ensemble(
+    args: Hyperparameters,
+    model_a: nn.Module,
+    model_b: nn.Module,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+    stride: int,
+    batch_seqs: int = 32,
+) -> tuple[float, float]:
+    """Sliding window eval with logit ensemble: (logits_a + logits_b) / 2."""
+    seq_len = args.train_seq_len
+    total_tokens = val_tokens.numel() - 1
+    window_starts = [ws for ws in range(0, total_tokens, stride)
+                     if min(ws + seq_len, total_tokens) - ws >= stride or ws == 0]
+    total_windows = len(window_starts)
+    my_s = (total_windows * rank) // world_size
+    my_e = (total_windows * (rank + 1)) // world_size
+    my_windows = window_starts[my_s:my_e]
+
+    loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    token_count = torch.zeros((), device=device, dtype=torch.float64)
+    byte_count = torch.zeros((), device=device, dtype=torch.float64)
+
+    model_a.eval()
+    model_b.eval()
+    with torch.inference_mode():
+        for bi in range(0, len(my_windows), batch_seqs):
+            batch_ws = my_windows[bi:bi + batch_seqs]
+            bsz = len(batch_ws)
+            x_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
+            y_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
+            wlens: list[int] = []
+            for i, ws in enumerate(batch_ws):
+                end = min(ws + seq_len, total_tokens)
+                wlen = end - ws
+                wlens.append(wlen)
+                chunk = val_tokens[ws:end + 1].to(dtype=torch.int64, device=device)
+                x_batch[i, :wlen] = chunk[:-1]
+                y_batch[i, :wlen] = chunk[1:]
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                logits_a = model_a.forward_logits(x_batch)
+                logits_b = model_b.forward_logits(x_batch)
+            # Average logits from both models
+            logits = (logits_a + logits_b) / 2.0
+            nll = F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)).float(),
+                y_batch.reshape(-1),
+                reduction="none",
+            ).reshape(bsz, seq_len)
+            for i, ws in enumerate(batch_ws):
+                wlen = wlens[i]
+                s = 0 if ws == 0 else max(wlen - stride, 0)
+                scored_nll = nll[i, s:wlen].to(torch.float64)
+                loss_sum += scored_nll.sum()
+                token_count += float(wlen - s)
+                tgt = y_batch[i, s:wlen]
+                prev = x_batch[i, s:wlen]
+                tb = base_bytes_lut[tgt].to(torch.float64)
+                tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
+                byte_count += tb.sum()
+            if rank == 0 and (bi // batch_seqs) % 50 == 0:
+                done = min(bi + batch_seqs, len(my_windows))
+                pct = done / len(my_windows) * 100
+                running_bpb = 0.0
+                if token_count.item() > 0:
+                    rl = (loss_sum / token_count).item()
+                    running_bpb = rl / math.log(2.0) * (token_count.item() / byte_count.item())
+                print(f"  ensemble_eval [{pct:5.1f}%] {done}/{len(my_windows)} windows running_bpb={running_bpb:.6f}", flush=True)
+
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(byte_count, op=dist.ReduceOp.SUM)
+
+    val_loss = (loss_sum / token_count).item()
+    bits_per_token = val_loss / math.log(2.0)
+    tokens_per_byte = token_count.item() / byte_count.item()
+    model_a.train()
     return val_loss, bits_per_token * tokens_per_byte
 
 
@@ -951,9 +1015,6 @@ def main() -> None:
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
 
     # MODEL + OPTIMIZER SETUP
-    exit_decoder_indices = [int(x) for x in args.exit_decoder_indices.split(",") if x.strip()]
-    log0(f"multi_exit_v2:decoder_indices={exit_decoder_indices} aux_loss_weight={args.aux_loss_weight}")
-
     base_model = GPT(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
@@ -968,7 +1029,6 @@ def main() -> None:
         qk_gain_init=args.qk_gain_init,
         bigram_vocab_size=args.bigram_vocab_size,
         bigram_dim=args.bigram_dim,
-        exit_decoder_indices=exit_decoder_indices,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1113,6 +1173,7 @@ def main() -> None:
     stop_after_step: int | None = None
     swa_state: dict[str, Tensor] | None = None
     swa_count = 0
+    swa_weight_sum = 0.0  # weighted SWA: linear increasing weights
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1177,16 +1238,18 @@ def main() -> None:
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
 
-        # SWA: collect checkpoints during warmdown
+        # Weighted SWA: collect checkpoints with linear increasing weights
         if args.swa_enabled and scale < args.swa_start_frac and step % args.swa_every == 0:
+            swa_count += 1
+            w = float(swa_count)  # linear weight: 1, 2, 3, ...
+            swa_weight_sum += w
             if swa_state is None:
-                swa_state = {name: t.detach().cpu().clone() for name, t in base_model.state_dict().items()}
-                swa_count = 1
-                log0(f"swa:start step:{step}")
+                swa_state = {name: w * t.detach().cpu().clone() for name, t in base_model.state_dict().items()}
+                log0(f"swa:start step:{step} weight:{w}")
             else:
                 for name, t in base_model.state_dict().items():
-                    swa_state[name] += t.detach().cpu()
-                swa_count += 1
+                    swa_state[name] += w * t.detach().cpu()
+                log0(f"swa:collect step:{step} weight:{w} count:{swa_count}")
 
         should_log_train = (
             args.train_log_every > 0
@@ -1214,12 +1277,16 @@ def main() -> None:
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
 
-    # Apply SWA if collected
+    # --- DELTA ENSEMBLE: save last state BEFORE SWA ---
+    last_state_cpu = {name: t.detach().cpu().clone() for name, t in base_model.state_dict().items()}
+    log0("delta_ensemble:saved last checkpoint state")
+
+    # Apply Weighted SWA if collected
     if args.swa_enabled and swa_state is not None and swa_count > 1:
-        log0(f"swa:applying averaged {swa_count} checkpoints")
+        log0(f"swa:applying weighted average {swa_count} checkpoints weight_sum:{swa_weight_sum}")
         current_state = base_model.state_dict()
         avg_state = {
-            name: (tensor / swa_count).to(dtype=current_state[name].dtype)
+            name: (tensor / swa_weight_sum).to(dtype=current_state[name].dtype)
             for name, tensor in swa_state.items()
         }
         base_model.load_state_dict(avg_state, strict=True)
@@ -1233,7 +1300,7 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
-    # Magnitude pruning: zero out smallest weights to improve compression
+    # Magnitude pruning on SWA model
     with torch.no_grad():
         for name, param in base_model.named_parameters():
             if param.ndim == 2 and param.numel() > 65536:
@@ -1241,7 +1308,15 @@ def main() -> None:
                 mask = param.abs() < threshold
                 param.masked_fill_(mask, 0.0)
 
-    # INT6 mixed quantization + zstd/zlib export
+    # Also prune last checkpoint
+    with torch.no_grad():
+        for name, tensor in last_state_cpu.items():
+            if tensor.ndim == 2 and tensor.numel() > 65536:
+                threshold = torch.quantile(tensor.abs().float().flatten(), 0.05)
+                mask = tensor.abs() < threshold
+                last_state_cpu[name] = tensor.masked_fill(mask, 0.0)
+
+    # --- Quantize SWA model (primary) ---
     sd_cpu = {k: v.detach().cpu() for k, v in base_model.state_dict().items()}
     quant_result, quant_meta = mixed_quantize_int6(sd_cpu, {"mlp", "attn", "bigram"})
     quant_buf = io.BytesIO()
@@ -1251,21 +1326,56 @@ def main() -> None:
         quant_blob = zstandard.ZstdCompressor(level=22).compress(quant_raw)
     else:
         quant_blob = zlib.compress(quant_raw, 9)
+
+    # --- Compute and compress delta (last - SWA) ---
+    # Quantize delta to int2 (4 levels: -1, 0, 0, 1) per-row with scale
+    delta_quant: dict[str, Tensor] = {}
+    delta_scales: dict[str, Tensor] = {}
+    for name in sd_cpu:
+        swa_t = sd_cpu[name].float()
+        last_t = last_state_cpu[name].float()
+        diff = last_t - swa_t
+        if diff.ndim == 2 and diff.numel() > 1024:
+            # Per-row int2 quantization: clip to [-1, 1] range with scale
+            row_max = diff.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)
+            normalized = diff / row_max
+            # Quantize to int2: round to {-1, 0, 1}
+            q = normalized.round().clamp(-1, 1).to(torch.int8)
+            delta_quant[name] = q
+            delta_scales[name] = row_max.squeeze(-1).half()
+        # Skip small tensors (biases, norms, etc.) — use SWA only
+
+    delta_buf = io.BytesIO()
+    torch.save({"q": delta_quant, "s": delta_scales}, delta_buf)
+    delta_raw = delta_buf.getvalue()
+    if _COMPRESSOR == "zstd":
+        delta_blob = zstandard.ZstdCompressor(level=22).compress(delta_raw)
+    else:
+        delta_blob = zlib.compress(delta_raw, 9)
+
     quant_file_bytes = 0
+    delta_file_bytes = 0
     total_bytes = 0
     if master_process:
         with open("final_model.int8.ptz", "wb") as f:
             f.write(quant_blob)
         quant_file_bytes = os.path.getsize("final_model.int8.ptz")
+        with open("delta.ptz", "wb") as f:
+            f.write(delta_blob)
+        delta_file_bytes = os.path.getsize("delta.ptz")
         code_bytes = len(code.encode("utf-8"))
-        log0(f"Serialized model int6+{_COMPRESSOR}: {quant_file_bytes} bytes")
-        total_bytes = quant_file_bytes + code_bytes
-        log0(f"Total submission size int8+zlib: {total_bytes} bytes")
+        log0(f"Serialized SWA model int6+{_COMPRESSOR}: {quant_file_bytes} bytes")
+        log0(f"Serialized delta int2+{_COMPRESSOR}: {delta_file_bytes} bytes")
+        total_bytes = quant_file_bytes + delta_file_bytes + code_bytes
+        log0(f"Total submission size (SWA+delta+code): {total_bytes} bytes")
         if total_bytes > 16_000_000:
             log0(f"WARNING: Total size {total_bytes} exceeds 16MB budget!")
 
+    # --- Roundtrip: reconstruct both models ---
     if distributed:
         dist.barrier()
+
+    # Load SWA model
     with open("final_model.int8.ptz", "rb") as f:
         quant_blob_disk = f.read()
     if _COMPRESSOR == "zstd":
@@ -1273,16 +1383,60 @@ def main() -> None:
     else:
         decompressed = zlib.decompress(quant_blob_disk)
     quant_state = torch.load(io.BytesIO(decompressed), map_location="cpu")
-    deq_state = dequantize_mixed_int6(quant_state["w"], quant_state["m"], sd_cpu)
-    base_model.load_state_dict(deq_state, strict=True)
+    swa_deq_state = dequantize_mixed_int6(quant_state["w"], quant_state["m"], sd_cpu)
 
-    # Sliding window eval on int6-roundtripped weights
+    # Load delta and reconstruct last model
+    with open("delta.ptz", "rb") as f:
+        delta_blob_disk = f.read()
+    if _COMPRESSOR == "zstd":
+        delta_decompressed = zstandard.ZstdDecompressor().decompress(delta_blob_disk)
+    else:
+        delta_decompressed = zlib.decompress(delta_blob_disk)
+    delta_state = torch.load(io.BytesIO(delta_decompressed), map_location="cpu")
+    last_deq_state = {}
+    for name, swa_t in swa_deq_state.items():
+        if name in delta_state["q"]:
+            dq = delta_state["q"][name].float()
+            ds = delta_state["s"][name].float().unsqueeze(-1)
+            last_deq_state[name] = swa_t + (dq * ds).to(dtype=swa_t.dtype)
+        else:
+            last_deq_state[name] = swa_t
+
+    # Create two models for ensemble eval
+    base_model.load_state_dict(swa_deq_state, strict=True)
+    swa_model_for_eval = base_model  # SWA model in base_model
+
+    # We need a second model instance for the last checkpoint
+    last_model = GPT(
+        vocab_size=args.vocab_size, num_layers=args.num_layers,
+        model_dim=args.model_dim, num_heads=args.num_heads,
+        num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
+        tie_embeddings=args.tie_embeddings, tied_embed_init_std=args.tied_embed_init_std,
+        logit_softcap=args.logit_softcap, rope_base=args.rope_base,
+        qk_gain_init=args.qk_gain_init, bigram_vocab_size=args.bigram_vocab_size,
+        bigram_dim=args.bigram_dim,
+    ).to(device).bfloat16()
+    last_model.load_state_dict(last_deq_state, strict=True)
+    last_model.eval()
+    log0("delta_ensemble:reconstructed SWA + last models for eval")
+
+    # --- Ensemble sliding window eval ---
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
+
+    # First: eval SWA model alone (for comparison)
     if args.eval_stride > 0 and args.eval_stride < args.train_seq_len:
         log0(f"final_eval_mode:sliding_window stride:{args.eval_stride} batch_seqs:{args.eval_batch_seqs}")
-        q_val_loss, q_val_bpb = eval_val_sliding(
-            args, base_model, rank, world_size, device,
+        q_val_loss_swa, q_val_bpb_swa = eval_val_sliding(
+            args, swa_model_for_eval, rank, world_size, device,
+            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+            stride=args.eval_stride, batch_seqs=args.eval_batch_seqs,
+        )
+        log0(f"swa_only val_bpb:{q_val_bpb_swa:.8f}")
+
+        # Now eval with ensemble: average logits from both models
+        q_val_loss, q_val_bpb = eval_val_sliding_ensemble(
+            args, swa_model_for_eval, last_model, rank, world_size, device,
             val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
             stride=args.eval_stride, batch_seqs=args.eval_batch_seqs,
         )
@@ -1294,13 +1448,14 @@ def main() -> None:
         )
     torch.cuda.synchronize()
     log0(
-        f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
+        f"final_delta_ensemble val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
-    log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    log0(f"final_delta_ensemble_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
     if master_process and _HAS_WANDB:
         wandb.log({"final_val_loss": q_val_loss, "final_val_bpb": q_val_bpb,
-                    "quant_file_bytes": quant_file_bytes, "total_bytes": total_bytes})
+                    "quant_file_bytes": quant_file_bytes, "delta_file_bytes": delta_file_bytes,
+                    "total_bytes": total_bytes})
         wandb.finish()
 
     if distributed:
