@@ -92,8 +92,10 @@ class Hyperparameters:
     muon_wd = float(os.environ.get("MUON_WD", 0.04))
     adam_wd = float(os.environ.get("ADAM_WD", 0.04))
     qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "0")))
-    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 6144))
+    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 4096))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
+    trigram_vocab_size = int(os.environ.get("TRIGRAM_VOCAB_SIZE", 4096))
+    trigram_dim = int(os.environ.get("TRIGRAM_DIM", 64))
     xsa_last_n = int(os.environ.get("XSA_LAST_N", 4))  # XSA on last 4 layers (0 = disabled)
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
     ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))
@@ -577,6 +579,31 @@ class BigramHashEmbedding(nn.Module):
         if self.proj is not None:
             h = self.proj(h)
         return h * self.scale.to(dtype=h.dtype)
+class TrigramHashEmbedding(nn.Module):
+    def __init__(self, trigram_vocab_size: int, trigram_dim: int, model_dim: int):
+        super().__init__()
+        self.trigram_vocab_size = trigram_vocab_size
+        self.embed = nn.Embedding(trigram_vocab_size, trigram_dim)
+        nn.init.zeros_(self.embed.weight)
+        self.proj = CastedLinear(trigram_dim, model_dim, bias=False) if trigram_dim != model_dim else None
+        if self.proj is not None:
+            nn.init.zeros_(self.proj.weight)
+        self.scale = nn.Parameter(torch.tensor(0.03, dtype=torch.float32))
+    def trigram_hash(self, tokens: Tensor) -> Tensor:
+        t = tokens.to(torch.int32)
+        mod = self.trigram_vocab_size - 1
+        out = torch.empty_like(t)
+        out[..., :2] = mod
+        out[..., 2:] = torch.bitwise_xor(
+            torch.bitwise_xor(48271 * t[..., 2:], 36313 * t[..., 1:-1]),
+            27191 * t[..., :-2]
+        ) % mod
+        return out.long()
+    def forward(self, token_ids: Tensor) -> Tensor:
+        h = self.embed(self.trigram_hash(token_ids))
+        if self.proj is not None:
+            h = self.proj(h)
+        return h * self.scale.to(dtype=h.dtype)
 class ValueEmbedding(nn.Module):
     """Reinject token identity into attention values at specific layers.
     Each table maps vocab tokens to a low-dim embedding, projected to model_dim."""
@@ -659,6 +686,8 @@ class GPT(nn.Module):
         mtp_loss_weight: float = 0.1,
         bigram_vocab_size: int = 0,
         bigram_dim: int = 128,
+        trigram_vocab_size: int = 0,
+        trigram_dim: int = 64,
         xsa_last_n: int = 0,
         rope_dims: int = 0,
         ln_scale: bool = False,
@@ -678,6 +707,7 @@ class GPT(nn.Module):
         self.mtp_loss_weight = mtp_loss_weight
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
+        self.trigram = TrigramHashEmbedding(trigram_vocab_size, trigram_dim, model_dim) if trigram_vocab_size > 0 else None
         self.smear = SmearGate(model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
@@ -754,6 +784,8 @@ class GPT(nn.Module):
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
             x = x + self.bigram(input_ids)
+        if self.trigram is not None:
+            x = x + self.trigram(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x = self.smear(x)
         x0 = x
@@ -802,6 +834,8 @@ class GPT(nn.Module):
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
             x = x + self.bigram(input_ids)
+        if self.trigram is not None:
+            x = x + self.trigram(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x = self.smear(x)
         x0 = x
@@ -1074,6 +1108,8 @@ def main() -> None:
         mtp_loss_weight=args.mtp_loss_weight,
         bigram_vocab_size=args.bigram_vocab_size,
         bigram_dim=args.bigram_dim,
+        trigram_vocab_size=args.trigram_vocab_size,
+        trigram_dim=args.trigram_dim,
         xsa_last_n=args.xsa_last_n,
         rope_dims=args.rope_dims,
         ln_scale=args.ln_scale,
@@ -1106,12 +1142,18 @@ def main() -> None:
     scalar_params.append(base_model.smear.gate)
     if base_model.bigram is not None:
         scalar_params.append(base_model.bigram.scale)
+    if base_model.trigram is not None:
+        scalar_params.append(base_model.trigram.scale)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     tok_params = [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}]
     if base_model.bigram is not None:
         tok_params.append({"params": [base_model.bigram.embed.weight], "lr": token_lr, "base_lr": token_lr})
         if base_model.bigram.proj is not None:
             matrix_params.append(base_model.bigram.proj.weight)
+    if base_model.trigram is not None:
+        tok_params.append({"params": [base_model.trigram.embed.weight], "lr": token_lr, "base_lr": token_lr})
+        if base_model.trigram.proj is not None:
+            matrix_params.append(base_model.trigram.proj.weight)
     if base_model.ve_shared is not None:
         tok_params.append({"params": [base_model.ve_shared.embed.weight], "lr": token_lr, "base_lr": token_lr})
         if base_model.ve_shared.proj is not None:
@@ -1214,6 +1256,7 @@ def main() -> None:
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
     swa_state: dict[str, Tensor] | None = None
     swa_count = 0
+    swa_weight_sum = 0.0
     ema_state = {name: t.detach().float().clone() for name, t in base_model.state_dict().items()}
     ema_decay = 0.997
     training_time_ms = 0.0
@@ -1287,14 +1330,16 @@ def main() -> None:
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         if args.swa_enabled and scale < 0.2 and step % args.swa_every == 0:
+            swa_count += 1
+            w = float(swa_count)
+            swa_weight_sum += w
             if swa_state is None:
-                swa_state = {name: t.detach().cpu().clone() for name, t in base_model.state_dict().items()}
-                swa_count = 1
-                log0(f"swa:start step:{step}")
+                swa_state = {name: w * t.detach().cpu().float().clone() for name, t in base_model.state_dict().items()}
+                log0(f"swa:start step:{step} weight:{w}")
             else:
                 for name, t in base_model.state_dict().items():
-                    swa_state[name] += t.detach().cpu()
-                swa_count += 1
+                    swa_state[name] += w * t.detach().cpu().float()
+                log0(f"swa:collect step:{step} count:{swa_count} weight:{w}")
         should_log_train = (
             args.train_log_every > 0
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
@@ -1315,10 +1360,17 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
-    # Apply EMA weights (better than SWA alone per PR#401)
-    log0("ema:applying EMA weights")
+    # Blend EMA + Weighted SWA
     current_state = base_model.state_dict()
-    avg_state = {name: t.to(dtype=current_state[name].dtype) for name, t in ema_state.items()}
+    if swa_state is not None and swa_weight_sum > 0:
+        swa_avg = {name: (t / swa_weight_sum).to(dtype=current_state[name].dtype) for name, t in swa_state.items()}
+        ema_avg = {name: t.to(dtype=current_state[name].dtype) for name, t in ema_state.items()}
+        blend_alpha = 0.5
+        avg_state = {name: blend_alpha * ema_avg[name] + (1 - blend_alpha) * swa_avg[name] for name in current_state}
+        log0(f"blend:EMA({blend_alpha})+WeightedSWA({1-blend_alpha}) swa_count:{swa_count} swa_weight_sum:{swa_weight_sum}")
+    else:
+        avg_state = {name: t.to(dtype=current_state[name].dtype) for name, t in ema_state.items()}
+        log0("ema:applying EMA weights only (no SWA)")
     base_model.load_state_dict(avg_state, strict=True)
     torch.cuda.synchronize()
     t_diag = time.perf_counter()
@@ -1328,7 +1380,7 @@ def main() -> None:
     )
     torch.cuda.synchronize()
     log0(
-        f"DIAGNOSTIC post_ema val_loss:{diag_val_loss:.4f} val_bpb:{diag_val_bpb:.4f} "
+        f"DIAGNOSTIC post_blend val_loss:{diag_val_loss:.4f} val_bpb:{diag_val_bpb:.4f} "
         f"eval_time:{1000.0 * (time.perf_counter() - t_diag):.0f}ms"
     )
     full_state_dict = base_model.state_dict()
@@ -1372,6 +1424,7 @@ def main() -> None:
         logit_softcap=args.logit_softcap, rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
         mtp_num_heads=0, mtp_loss_weight=0.0,
         bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
+        trigram_vocab_size=args.trigram_vocab_size, trigram_dim=args.trigram_dim,
         xsa_last_n=args.xsa_last_n,  # must match training model
         rope_dims=args.rope_dims, ln_scale=args.ln_scale, dtg=args.dtg_enabled,
         ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,

@@ -23,7 +23,25 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
-from flash_attn_interface import flash_attn_func as flash_attn_3_func
+try:
+    from flash_attn_interface import flash_attn_func as _fa3_func
+    _USE_FA3 = True
+except ImportError:
+    _USE_FA3 = False
+def flash_attn_3_func(q, k, v, causal=True):
+    """Wrapper: uses FA3 if available, else F.scaled_dot_product_attention.
+    FA3 expects (B, T, H, D) in/out. SDPA expects (B, H, T, D)."""
+    if _USE_FA3:
+        return _fa3_func(q, k, v, causal=causal)
+    # Transpose to (B, H, T, D) for SDPA
+    q_t = q.transpose(1, 2)
+    k_t = k.transpose(1, 2)
+    v_t = v.transpose(1, 2)
+    y = F.scaled_dot_product_attention(
+        q_t, k_t, v_t, attn_mask=None, is_causal=causal,
+        enable_gqa=(k.size(2) != q.size(2)),
+    )
+    return y.transpose(1, 2)  # Back to (B, T, H, D)
 class Hyperparameters:
     data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
@@ -1141,6 +1159,7 @@ def main() -> None:
     log0(f"XSA:last_{args.xsa_last_n} active_layers:{xsa_layers}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
+    log0(f"attention_backend:{'flash_attn_3' if _USE_FA3 else 'sdpa_fallback'}")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "

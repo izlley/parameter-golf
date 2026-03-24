@@ -92,7 +92,7 @@ class Hyperparameters:
     muon_wd = float(os.environ.get("MUON_WD", 0.04))
     adam_wd = float(os.environ.get("ADAM_WD", 0.04))
     qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "0")))
-    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 6144))
+    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 2048))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
     xsa_last_n = int(os.environ.get("XSA_LAST_N", 4))  # XSA on last 4 layers (0 = disabled)
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
@@ -115,12 +115,17 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
         X = a * X + B @ X
     return X.T if transposed else X
 class Muon(torch.optim.Optimizer):
+    """Mousse: Muon + per-parameter adaptive momentum via gradient norm variance.
+    High gradient variance params get lower momentum (more responsive).
+    Low gradient variance params get higher momentum (more stable)."""
     def __init__(self, params, lr: float, momentum: float, backend_steps: int,
-                 nesterov: bool = True, weight_decay: float = 0.0):
+                 nesterov: bool = True, weight_decay: float = 0.0,
+                 mousse_beta: float = 0.999, mousse_range: float = 0.1):
         super().__init__(
             params,
             dict(lr=lr, momentum=momentum, backend_steps=backend_steps,
-                 nesterov=nesterov, weight_decay=weight_decay),
+                 nesterov=nesterov, weight_decay=weight_decay,
+                 mousse_beta=mousse_beta, mousse_range=mousse_range),
         )
     @torch.no_grad()
     def step(self, closure=None):
@@ -139,6 +144,8 @@ class Muon(torch.optim.Optimizer):
             momentum = group["momentum"]
             backend_steps = group["backend_steps"]
             nesterov = group["nesterov"]
+            mousse_beta = group.get("mousse_beta", 0.999)
+            mousse_range = group.get("mousse_range", 0.1)
             total_params = sum(int(p.numel()) for p in params)
             updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.bfloat16)
             curr = 0
@@ -148,10 +155,29 @@ class Muon(torch.optim.Optimizer):
                     state = self.state[p]
                     if "momentum_buffer" not in state:
                         state["momentum_buffer"] = torch.zeros_like(g)
+                        state["grad_norm_ema"] = torch.tensor(0.0, device=g.device)
+                        state["grad_norm_sq_ema"] = torch.tensor(0.0, device=g.device)
+                        state["step_count"] = 0
                     buf = state["momentum_buffer"]
-                    buf.mul_(momentum).add_(g)
+                    # Track gradient norm variance for adaptive momentum
+                    state["step_count"] += 1
+                    g_norm = g.float().norm().item()
+                    state["grad_norm_ema"].mul_(mousse_beta).add_(g_norm, alpha=1 - mousse_beta)
+                    state["grad_norm_sq_ema"].mul_(mousse_beta).add_(g_norm ** 2, alpha=1 - mousse_beta)
+                    # Compute variance and adapt momentum
+                    bc = 1 - mousse_beta ** state["step_count"]  # bias correction
+                    mean_norm = state["grad_norm_ema"].item() / bc
+                    mean_sq_norm = state["grad_norm_sq_ema"].item() / bc
+                    variance = max(mean_sq_norm - mean_norm ** 2, 0.0)
+                    cv = (variance ** 0.5) / (mean_norm + 1e-8)  # coefficient of variation
+                    # Clamp CV to [0, 1] and scale momentum
+                    cv_clamped = min(cv, 1.0)
+                    # High CV → lower momentum (more responsive)
+                    effective_momentum = momentum - mousse_range * cv_clamped
+                    effective_momentum = max(effective_momentum, momentum - mousse_range)
+                    buf.mul_(effective_momentum).add_(g)
                     if nesterov:
-                        g = g.add(buf, alpha=momentum)
+                        g = g.add(buf, alpha=effective_momentum)
                     g = zeropower_via_newtonschulz5(g, steps=backend_steps)
                     g *= max(1, g.size(0) / g.size(1)) ** 0.5
                     updates_flat[curr : curr + p.numel()] = g.reshape(-1)

@@ -92,7 +92,7 @@ class Hyperparameters:
     muon_wd = float(os.environ.get("MUON_WD", 0.04))
     adam_wd = float(os.environ.get("ADAM_WD", 0.04))
     qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "0")))
-    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 6144))
+    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 2048))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
     xsa_last_n = int(os.environ.get("XSA_LAST_N", 4))  # XSA on last 4 layers (0 = disabled)
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
@@ -102,6 +102,7 @@ class Hyperparameters:
     ve_enabled = bool(int(os.environ.get("VE_ENABLED", "1")))
     ve_dim = int(os.environ.get("VE_DIM", 128))
     ve_layers = os.environ.get("VE_LAYERS", "9,10")
+    vrl_enabled = bool(int(os.environ.get("VRL_ENABLED", "1")))
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
     a, b, c = (3.4445, -4.7750, 2.0315)
     X = G.bfloat16()
@@ -528,13 +529,15 @@ class CausalSelfAttention(nn.Module):
         vn = F.normalize(v, dim=-1).unsqueeze(-2)    # [B, T, Hkv, 1, D] — broadcast ready
         proj = (y_g * vn).sum(dim=-1, keepdim=True) * vn
         return (y_g - proj).reshape(B, T, H, D)
-    def forward(self, x: Tensor, v_embed: Tensor | None = None) -> Tensor:
+    def forward(self, x: Tensor, v_embed: Tensor | None = None, v_residual: Tensor | None = None) -> Tensor:
         bsz, seqlen, dim = x.shape
         q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim)
         k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
         v = self.c_v(x)
         if v_embed is not None:
             v = v + v_embed
+        if v_residual is not None:
+            v = v + v_residual
         v = v.reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
@@ -631,10 +634,10 @@ class Block(nn.Module):
             nn.init.constant_(self.dtg_gate.bias, 2.0)
         else:
             self.dtg_gate = None
-    def forward(self, x: Tensor, x0: Tensor, v_embed: Tensor | None = None) -> Tensor:
+    def forward(self, x: Tensor, x0: Tensor, v_embed: Tensor | None = None, v_residual: Tensor | None = None) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x_in) * self.ln_scale_factor, v_embed=v_embed)
+        attn_out = self.attn(self.attn_norm(x_in) * self.ln_scale_factor, v_embed=v_embed, v_residual=v_residual)
         x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
         x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor)
         if self.dtg_gate is not None:
@@ -666,6 +669,7 @@ class GPT(nn.Module):
         ve_enabled: bool = False,
         ve_dim: int = 128,
         ve_layers: str = "9,10",
+        vrl_enabled: bool = False,
     ):
         super().__init__()
         self._ve_target_dim = num_kv_heads * (model_dim // num_heads)  # kv_dim for value projection
@@ -727,6 +731,14 @@ class GPT(nn.Module):
         if xsa_last_n > 0:
             for i in range(max(0, num_layers - xsa_last_n), num_layers):
                 self.blocks[i].attn.use_xsa = True
+        # VRL: per-layer lambda for V₀ residual injection
+        self.vrl_enabled = vrl_enabled
+        if vrl_enabled:
+            self.vrl_lambdas = nn.ParameterList(
+                [nn.Parameter(torch.tensor(0.1, dtype=torch.float32)) for _ in range(num_layers)]
+            )
+        else:
+            self.vrl_lambdas = nn.ParameterList()
         self._init_weights()
     def _init_weights(self) -> None:
         if self.tie_embeddings:
@@ -750,6 +762,14 @@ class GPT(nn.Module):
         ve_base = ve_cache['ve'] if ve_cache is not None else self.ve_shared(input_ids)
         ve_idx = self.ve_layer_indices.index(layer_idx)
         return ve_base * self.ve_layer_scales[ve_idx].to(dtype=ve_base.dtype)
+    def _compute_vrl(self, layer_idx: int, x_normed: Tensor, v0_cache: Tensor | None) -> Tensor | None:
+        """Compute VRL residual: lambda_i * V₀ for layer i (skip layer 0 and VE layers)."""
+        if not self.vrl_enabled or v0_cache is None or layer_idx == 0:
+            return None
+        if layer_idx in self.ve_layer_indices:
+            return None  # VE already injects token identity
+        lam = self.vrl_lambdas[layer_idx].to(dtype=v0_cache.dtype)
+        return lam * v0_cache
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
@@ -759,16 +779,24 @@ class GPT(nn.Module):
         x0 = x
         skips: list[Tensor] = []
         ve_cache: dict = {}
+        v0_cache: Tensor | None = None
         for i in range(self.num_encoder_layers):
             ve = self._get_ve(i, input_ids, ve_cache)
-            x = self.blocks[i](x, x0, v_embed=ve)
+            if self.vrl_enabled and i == 0:
+                # Cache V₀ from layer 0 (before block forward)
+                mix = self.blocks[0].resid_mix.to(dtype=x.dtype)
+                x_mixed = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+                v0_cache = self.blocks[0].attn.c_v(self.blocks[0].attn_norm(x_mixed) * self.blocks[0].ln_scale_factor).detach()
+            v_res = self._compute_vrl(i, x, v0_cache)
+            x = self.blocks[i](x, x0, v_embed=ve, v_residual=v_res)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             bi = self.num_encoder_layers + i
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             ve = self._get_ve(bi, input_ids, ve_cache)
-            x = self.blocks[bi](x, x0, v_embed=ve)
+            v_res = self._compute_vrl(bi, x, v0_cache)
+            x = self.blocks[bi](x, x0, v_embed=ve, v_residual=v_res)
         x = self.final_norm(x)
         x_flat = x.reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -807,16 +835,23 @@ class GPT(nn.Module):
         x0 = x
         skips: list[Tensor] = []
         ve_cache: dict = {}
+        v0_cache: Tensor | None = None
         for i in range(self.num_encoder_layers):
             ve = self._get_ve(i, input_ids, ve_cache)
-            x = self.blocks[i](x, x0, v_embed=ve)
+            if self.vrl_enabled and i == 0:
+                mix = self.blocks[0].resid_mix.to(dtype=x.dtype)
+                x_mixed = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+                v0_cache = self.blocks[0].attn.c_v(self.blocks[0].attn_norm(x_mixed) * self.blocks[0].ln_scale_factor)
+            v_res = self._compute_vrl(i, x, v0_cache)
+            x = self.blocks[i](x, x0, v_embed=ve, v_residual=v_res)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             bi = self.num_encoder_layers + i
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             ve = self._get_ve(bi, input_ids, ve_cache)
-            x = self.blocks[bi](x, x0, v_embed=ve)
+            v_res = self._compute_vrl(bi, x, v0_cache)
+            x = self.blocks[bi](x, x0, v_embed=ve, v_residual=v_res)
         x = self.final_norm(x)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
@@ -1081,6 +1116,7 @@ def main() -> None:
         ve_enabled=args.ve_enabled,
         ve_dim=args.ve_dim,
         ve_layers=args.ve_layers,
+        vrl_enabled=args.vrl_enabled,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1106,6 +1142,9 @@ def main() -> None:
     scalar_params.append(base_model.smear.gate)
     if base_model.bigram is not None:
         scalar_params.append(base_model.bigram.scale)
+    if base_model.vrl_enabled:
+        for lam in base_model.vrl_lambdas:
+            scalar_params.append(lam)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     tok_params = [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}]
     if base_model.bigram is not None:
@@ -1375,6 +1414,7 @@ def main() -> None:
         xsa_last_n=args.xsa_last_n,  # must match training model
         rope_dims=args.rope_dims, ln_scale=args.ln_scale, dtg=args.dtg_enabled,
         ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
+        vrl_enabled=args.vrl_enabled,
     ).to(device).bfloat16()
     for m in eval_model.modules():
         if isinstance(m, CastedLinear):
