@@ -1419,7 +1419,8 @@ def main() -> None:
                 removed = prune_model_inplace(base_model, bi_scores, args.prune_layers, device)
                 new_n = len(base_model.blocks)
                 log0(f"progressive_prune:removed layers {removed}, remaining:{new_n}")
-                # 3. Unwrap DDP, recompile, re-wrap
+                # 3. Reset dynamo cache (old 13L traces are invalid), recompile, re-wrap
+                torch._dynamo.reset()
                 compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
                 model = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
                 # 4. Rebuild optimizer param groups
@@ -1593,6 +1594,7 @@ def main() -> None:
             m.float()
     restore_low_dim_params_to_fp32(eval_model)
     eval_model.load_state_dict(deq_state, strict=True)
+    torch._dynamo.reset()  # clear traces from training model (different layer count)
     compiled_eval = torch.compile(eval_model, dynamic=False, fullgraph=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
