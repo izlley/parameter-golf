@@ -522,6 +522,7 @@ class SSMHead(nn.Module):
         self.out_gate = nn.Linear(ssm_dim, ssm_dim, bias=False)
         nn.init.ones_(self.out_gate.weight)
 
+    @torch.compiler.disable
     def _simple_recurrent_scan(self, x_conv: Tensor, dA: Tensor, dB: Tensor, C_t: Tensor) -> Tensor:
         """Simple step-by-step recurrent SSM scan. Numerically stable (no exp/log tricks).
         x_conv: (B, T, D), dA: (B, T, N), dB: (B, T, N), C_t: (B, T, N)
@@ -1060,7 +1061,7 @@ def eval_val_sliding(
     token_count = torch.zeros((), device=device, dtype=torch.float64)
     byte_count = torch.zeros((), device=device, dtype=torch.float64)
     base_model.eval()
-    compiled_logits = torch.compile(base_model.forward_logits, dynamic=False, fullgraph=True)
+    compiled_logits = torch.compile(base_model.forward_logits, dynamic=False, fullgraph=False)
     total_batches = (len(my_windows) + batch_seqs - 1) // batch_seqs
     with torch.inference_mode():
         for bi_idx, bi in enumerate(range(0, len(my_windows), batch_seqs)):
@@ -1313,7 +1314,7 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=False)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
     block_named_params = list(base_model.blocks.named_parameters())
     matrix_params = [
@@ -1615,7 +1616,7 @@ def main() -> None:
             m.float()
     restore_low_dim_params_to_fp32(eval_model)
     eval_model.load_state_dict(deq_state, strict=True)
-    compiled_eval = torch.compile(eval_model, dynamic=False, fullgraph=True)
+    compiled_eval = torch.compile(eval_model, dynamic=False, fullgraph=False)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
