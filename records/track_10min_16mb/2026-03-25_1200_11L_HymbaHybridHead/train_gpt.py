@@ -28,6 +28,7 @@ try:
     _USE_FA3 = True
 except ImportError:
     _USE_FA3 = False
+from mamba_ssm import Mamba
 def flash_attn_3_func(q, k, v, causal=True):
     """Wrapper: uses FA3 if available, else F.scaled_dot_product_attention.
     FA3 expects (B, T, H, D) in/out. SDPA expects (B, H, T, D)."""
@@ -493,89 +494,7 @@ def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor, rope_dims: int = 0) ->
     half = x.size(-1) // 2
     x1, x2 = x[..., :half], x[..., half:]
     return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
-class SSMHead(nn.Module):
-    """Simple SSM head for Hymba hybrid attention.
-    Pure PyTorch recurrent scan, torch.compile(fullgraph=True) compatible.
-    Inspired by NVlabs/hymba: LayerNorm on B/C/dt for numerical stability.
-    """
-    def __init__(self, ssm_dim: int, d_state: int = 16, d_conv: int = 4):
-        super().__init__()
-        self.ssm_dim = ssm_dim
-        self.d_state = d_state
-        # Conv1d for local context
-        self.conv1d = nn.Conv1d(ssm_dim, ssm_dim, d_conv, padding=d_conv - 1, groups=ssm_dim, bias=True)
-        nn.init.zeros_(self.conv1d.bias)
-        # SSM projections: B, C, and dt from same projection (like Hymba)
-        self.x_proj = nn.Linear(ssm_dim, d_state * 2 + 1, bias=False)
-        nn.init.normal_(self.x_proj.weight, std=0.01)
-        # LayerNorm on B, C, dt for stability (Hymba-style)
-        self.B_norm = nn.LayerNorm(d_state)
-        self.C_norm = nn.LayerNorm(d_state)
-        self.dt_norm = nn.LayerNorm(1)
-        # dt bias (learned, initialized small)
-        self.dt_bias = nn.Parameter(torch.full((1,), -3.0))
-        # A parameter (diagonal, real, negative for stability)
-        A = -torch.arange(1, d_state + 1, dtype=torch.float32)
-        self.A_log = nn.Parameter(torch.log(-A))  # log for numerical stability
-        self.D = nn.Parameter(torch.ones(ssm_dim))
-        # Output gate
-        self.out_gate = nn.Linear(ssm_dim, ssm_dim, bias=False)
-        nn.init.ones_(self.out_gate.weight)
-
-    @torch.compiler.disable
-    def _simple_recurrent_scan(self, x_conv: Tensor, dA: Tensor, dB: Tensor, C_t: Tensor) -> Tensor:
-        """Simple step-by-step recurrent SSM scan. Numerically stable (no exp/log tricks).
-        x_conv: (B, T, D), dA: (B, T, N), dB: (B, T, N), C_t: (B, T, N)
-        Returns: (B, T, D)
-        """
-        B, T, D = x_conv.shape
-        N = dA.shape[-1]
-        h = torch.zeros(B, D, N, device=x_conv.device, dtype=x_conv.dtype)
-        outputs = []
-        for t in range(T):
-            # h = dA[t] * h + dB[t] * x[t]
-            h = dA[:, t, :].unsqueeze(1) * h + \
-                x_conv[:, t, :].unsqueeze(-1) * dB[:, t, :].unsqueeze(1)  # (B, D, N)
-            # y[t] = sum_n C[t,n] * h[:,n]
-            y_t = (h * C_t[:, t, :].unsqueeze(1)).sum(-1)  # (B, D)
-            outputs.append(y_t)
-        return torch.stack(outputs, dim=1)  # (B, T, D)
-
-    def forward(self, x: Tensor) -> Tensor:
-        """x: (batch, seq_len, ssm_dim) -> (batch, seq_len, ssm_dim)"""
-        bsz, seq_len, dim = x.shape
-
-        # Conv1d (stays in input dtype)
-        x_conv = self.conv1d(x.transpose(1, 2))[:, :, :seq_len].transpose(1, 2)
-        x_conv = F.silu(x_conv)
-
-        # SSM parameter projection + LayerNorm (Hymba-style stability)
-        BCdt = self.x_proj(x_conv)  # (B, T, 2*d_state + 1)
-        B_t = self.B_norm(BCdt[..., :self.d_state]).float()
-        C_t = self.C_norm(BCdt[..., self.d_state:2*self.d_state]).float()
-        dt_raw = self.dt_norm(BCdt[..., 2*self.d_state:])  # (B, T, 1)
-
-        dt = F.softplus(dt_raw.float() + self.dt_bias.float()).clamp(min=1e-4, max=5.0)
-        A = -torch.exp(self.A_log.float())  # (d_state,) negative real
-
-        # Discretize: dA = exp(A * dt), dB = dt * B
-        dA = torch.exp(A[None, None, :] * dt)  # (B, T, d_state), always in (0, 1]
-        dB = dt * B_t  # (B, T, d_state)
-
-        # Simple recurrent scan (numerically stable, no log-space tricks)
-        y = self._simple_recurrent_scan(x_conv.float(), dA, dB, C_t)
-
-        # Add skip connection with D parameter
-        y = y + self.D.float()[None, None, :] * x_conv.float()
-
-        # Cast back to input dtype
-        y = y.to(x.dtype)
-
-        # Gated output (in input dtype)
-        gate = torch.sigmoid(self.out_gate(x))
-        y = gate * y
-
-        return y
+## SSMHead removed — replaced by mamba_ssm.Mamba (CUDA kernel-based selective scan)
 
 
 class HybridAttention(nn.Module):
@@ -610,10 +529,10 @@ class HybridAttention(nn.Module):
         self.c_k = CastedLinear(dim, kv_dim, bias=False)
         self.c_v = CastedLinear(dim, kv_dim, bias=False)
 
-        # SSM heads
+        # SSM heads (using mamba_ssm CUDA kernel)
         ssm_dim = self.num_ssm_heads * self.head_dim
         self.ssm_proj_in = CastedLinear(dim, ssm_dim, bias=False)
-        self.ssm = SSMHead(ssm_dim, d_state=d_state, d_conv=d_conv)
+        self.ssm = Mamba(d_model=ssm_dim, d_state=d_state, d_conv=d_conv, expand=1)
         self.attn_proj_up = CastedLinear(attn_dim, dim, bias=False)  # project attn to full dim
         self.ssm_proj_out = CastedLinear(ssm_dim, dim, bias=False)  # project SSM to full dim
 
