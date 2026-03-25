@@ -571,42 +571,40 @@ class SSMHead(nn.Module):
 
         return torch.cat(outputs, dim=1)  # (B, T, D)
 
-    @torch.autocast(device_type="cuda", enabled=False)
     def forward(self, x: Tensor) -> Tensor:
-        """x: (batch, seq_len, ssm_dim) -> (batch, seq_len, ssm_dim)
-        Forces float32 — SSM scan accumulation is numerically unstable in bfloat16.
-        """
-        orig_dtype = x.dtype
-        x = x.float()
+        """x: (batch, seq_len, ssm_dim) -> (batch, seq_len, ssm_dim)"""
         bsz, seq_len, dim = x.shape
 
-        # Conv1d
+        # Conv1d (stays in input dtype)
         x_conv = self.conv1d(x.transpose(1, 2))[:, :, :seq_len].transpose(1, 2)
         x_conv = F.silu(x_conv)
 
-        # SSM computation (parallel scan)
+        # SSM computation — upcast to float32 for scan stability
         BC = self.x_proj(x_conv)  # (B, T, 2*d_state)
-        B_t = BC[..., :self.d_state]  # (B, T, d_state)
-        C_t = BC[..., self.d_state:]  # (B, T, d_state)
+        B_t = BC[..., :self.d_state].float()
+        C_t = BC[..., self.d_state:].float()
 
-        dt = F.softplus(self.dt_proj(x_conv))  # (B, T, 1)
+        dt = F.softplus(self.dt_proj(x_conv)).float()  # (B, T, 1)
         A = -torch.exp(self.A_log.float())  # (d_state,) negative real
 
         # Discretize: dA = exp(A * dt), dB = dt * B
         dA = torch.exp(A[None, None, :] * dt)  # (B, T, d_state)
         dB = dt * B_t  # (B, T, d_state)
 
-        # Chunked scan (numerically stable)
-        y = self._chunked_scan(x_conv, dA, dB, C_t)
+        # Chunked scan in float32 (numerically stable)
+        y = self._chunked_scan(x_conv.float(), dA, dB, C_t)
 
         # Add skip connection with D parameter
-        y = y + self.D[None, None, :] * x_conv
+        y = y + self.D.float()[None, None, :] * x_conv.float()
 
-        # Gated output
+        # Cast back to input dtype
+        y = y.to(x.dtype)
+
+        # Gated output (in input dtype)
         gate = torch.sigmoid(self.out_gate(x))
         y = gate * y
 
-        return y.to(orig_dtype)
+        return y
 
 
 class HybridAttention(nn.Module):
