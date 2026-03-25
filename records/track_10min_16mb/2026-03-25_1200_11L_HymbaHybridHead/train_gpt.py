@@ -495,8 +495,8 @@ def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor, rope_dims: int = 0) ->
     return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
 class SSMHead(nn.Module):
     """Simple SSM head for Hymba hybrid attention.
-    Processes features using a simplified state space model with parallel scan.
-    Pure PyTorch, no custom CUDA kernels, torch.compile(fullgraph=True) compatible.
+    Pure PyTorch recurrent scan, torch.compile(fullgraph=True) compatible.
+    Inspired by NVlabs/hymba: LayerNorm on B/C/dt for numerical stability.
     """
     def __init__(self, ssm_dim: int, d_state: int = 16, d_conv: int = 4):
         super().__init__()
@@ -505,12 +505,15 @@ class SSMHead(nn.Module):
         # Conv1d for local context
         self.conv1d = nn.Conv1d(ssm_dim, ssm_dim, d_conv, padding=d_conv - 1, groups=ssm_dim, bias=True)
         nn.init.zeros_(self.conv1d.bias)
-        # SSM projections: B and C
-        self.x_proj = nn.Linear(ssm_dim, d_state * 2, bias=False)
+        # SSM projections: B, C, and dt from same projection (like Hymba)
+        self.x_proj = nn.Linear(ssm_dim, d_state * 2 + 1, bias=False)
         nn.init.normal_(self.x_proj.weight, std=0.01)
-        # Discretization
-        self.dt_proj = nn.Linear(ssm_dim, 1, bias=True)
-        nn.init.constant_(self.dt_proj.bias, -3.0)  # small initial dt
+        # LayerNorm on B, C, dt for stability (Hymba-style)
+        self.B_norm = nn.LayerNorm(d_state)
+        self.C_norm = nn.LayerNorm(d_state)
+        self.dt_norm = nn.LayerNorm(1)
+        # dt bias (learned, initialized small)
+        self.dt_bias = nn.Parameter(torch.full((1,), -3.0))
         # A parameter (diagonal, real, negative for stability)
         A = -torch.arange(1, d_state + 1, dtype=torch.float32)
         self.A_log = nn.Parameter(torch.log(-A))  # log for numerical stability
@@ -519,57 +522,23 @@ class SSMHead(nn.Module):
         self.out_gate = nn.Linear(ssm_dim, ssm_dim, bias=False)
         nn.init.ones_(self.out_gate.weight)
 
-    def _chunked_scan(self, x_conv: Tensor, dA: Tensor, dB: Tensor, C_t: Tensor,
-                      chunk_size: int = 64) -> Tensor:
-        """Numerically stable chunked SSM scan.
-        Within each chunk: use log-space cumsum (safe because chunk_size is small).
-        Across chunks: carry state via recurrence.
+    def _simple_recurrent_scan(self, x_conv: Tensor, dA: Tensor, dB: Tensor, C_t: Tensor) -> Tensor:
+        """Simple step-by-step recurrent SSM scan. Numerically stable (no exp/log tricks).
         x_conv: (B, T, D), dA: (B, T, N), dB: (B, T, N), C_t: (B, T, N)
         Returns: (B, T, D)
         """
         B, T, D = x_conv.shape
         N = dA.shape[-1]
-
-        outputs = []
         h = torch.zeros(B, D, N, device=x_conv.device, dtype=x_conv.dtype)
-
-        for t0 in range(0, T, chunk_size):
-            t1 = min(t0 + chunk_size, T)
-
-            dA_c = dA[:, t0:t1]      # (B, L, N)
-            dB_c = dB[:, t0:t1]      # (B, L, N)
-            x_c = x_conv[:, t0:t1]   # (B, L, D)
-            C_c = C_t[:, t0:t1]      # (B, L, N)
-
-            # --- intra-chunk via log-space (small L, no overflow) ---
-            log_dA_c = torch.log(dA_c.clamp_min(1e-8))       # (B, L, N)
-            log_dA_cum = torch.cumsum(log_dA_c, dim=1)        # (B, L, N)
-
-            # Input contribution: inp[t] = dB[t] * x[t]
-            inp = x_c.unsqueeze(-1) * dB_c.unsqueeze(2)       # (B, L, D, N)
-
-            # Normalize by cumulative decay for stable cumsum
-            inv_decay = torch.exp(-log_dA_cum).unsqueeze(2)    # (B, L, 1, N)
-            normed_inp = inv_decay * inp                       # (B, L, D, N)
-            normed_cumsum = torch.cumsum(normed_inp, dim=1)    # (B, L, D, N)
-
-            # Re-apply forward decay
-            fwd_decay = torch.exp(log_dA_cum).unsqueeze(2)     # (B, L, 1, N)
-            h_intra = fwd_decay * normed_cumsum                # (B, L, D, N)
-
-            # --- inter-chunk: add carried state h ---
-            # h contributes h * cumulative_decay_from_chunk_start
-            h_contrib = h.unsqueeze(1) * fwd_decay             # (B, L, D, N)
-            h_total = h_intra + h_contrib                      # (B, L, D, N)
-
-            # Output: y[t] = sum_n C[t,n] * h_total[t,:,n]
-            y_chunk = (h_total * C_c.unsqueeze(2)).sum(-1)     # (B, L, D)
-            outputs.append(y_chunk)
-
-            # Update state: h = h_total at last timestep
-            h = h_total[:, -1]  # (B, D, N)
-
-        return torch.cat(outputs, dim=1)  # (B, T, D)
+        outputs = []
+        for t in range(T):
+            # h = dA[t] * h + dB[t] * x[t]
+            h = dA[:, t:t+1, :].unsqueeze(1).expand_as(h) * h + \
+                x_conv[:, t, :].unsqueeze(-1) * dB[:, t, :].unsqueeze(1)  # (B, D, N)
+            # y[t] = sum_n C[t,n] * h[:,n]
+            y_t = (h * C_t[:, t, :].unsqueeze(1)).sum(-1)  # (B, D)
+            outputs.append(y_t)
+        return torch.stack(outputs, dim=1)  # (B, T, D)
 
     def forward(self, x: Tensor) -> Tensor:
         """x: (batch, seq_len, ssm_dim) -> (batch, seq_len, ssm_dim)"""
@@ -579,20 +548,21 @@ class SSMHead(nn.Module):
         x_conv = self.conv1d(x.transpose(1, 2))[:, :, :seq_len].transpose(1, 2)
         x_conv = F.silu(x_conv)
 
-        # SSM computation — upcast to float32 for scan stability
-        BC = self.x_proj(x_conv)  # (B, T, 2*d_state)
-        B_t = BC[..., :self.d_state].float()
-        C_t = BC[..., self.d_state:].float()
+        # SSM parameter projection + LayerNorm (Hymba-style stability)
+        BCdt = self.x_proj(x_conv)  # (B, T, 2*d_state + 1)
+        B_t = self.B_norm(BCdt[..., :self.d_state]).float()
+        C_t = self.C_norm(BCdt[..., self.d_state:2*self.d_state]).float()
+        dt_raw = self.dt_norm(BCdt[..., 2*self.d_state:])  # (B, T, 1)
 
-        dt = F.softplus(self.dt_proj(x_conv)).float()  # (B, T, 1)
+        dt = F.softplus(dt_raw.float() + self.dt_bias.float()).clamp(min=1e-4, max=5.0)
         A = -torch.exp(self.A_log.float())  # (d_state,) negative real
 
         # Discretize: dA = exp(A * dt), dB = dt * B
-        dA = torch.exp(A[None, None, :] * dt)  # (B, T, d_state)
+        dA = torch.exp(A[None, None, :] * dt)  # (B, T, d_state), always in (0, 1]
         dB = dt * B_t  # (B, T, d_state)
 
-        # Chunked scan in float32 (numerically stable)
-        y = self._chunked_scan(x_conv.float(), dA, dB, C_t)
+        # Simple recurrent scan (numerically stable, no log-space tricks)
+        y = self._simple_recurrent_scan(x_conv.float(), dA, dB, C_t)
 
         # Add skip connection with D parameter
         y = y + self.D.float()[None, None, :] * x_conv.float()
@@ -643,8 +613,14 @@ class HybridAttention(nn.Module):
         ssm_dim = self.num_ssm_heads * self.head_dim
         self.ssm_proj_in = CastedLinear(dim, ssm_dim, bias=False)
         self.ssm = SSMHead(ssm_dim, d_state=d_state, d_conv=d_conv)
+        self.attn_proj_up = CastedLinear(attn_dim, dim, bias=False)  # project attn to full dim
+        self.ssm_proj_out = CastedLinear(ssm_dim, dim, bias=False)  # project SSM to full dim
 
-        # Combined output projection
+        # Hymba-style: LayerNorm before averaging attn and SSM
+        self.attn_avg_norm = nn.LayerNorm(dim)
+        self.ssm_avg_norm = nn.LayerNorm(dim)
+
+        # Output projection (now from dim, not concat)
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
 
@@ -687,13 +663,14 @@ class HybridAttention(nn.Module):
             attn_out = self._xsa_efficient(attn_out, v)
 
         attn_out = attn_out.reshape(bsz, seqlen, self.num_attn_heads * self.head_dim)
+        attn_out = self.attn_proj_up(attn_out)  # (bsz, seqlen, dim)
 
         # === SSM path ===
         ssm_in = self.ssm_proj_in(x)
-        ssm_out = self.ssm(ssm_in)  # (bsz, seqlen, ssm_dim)
+        ssm_out = self.ssm_proj_out(self.ssm(ssm_in))  # (bsz, seqlen, dim)
 
-        # === Concatenate attention + SSM outputs ===
-        combined = torch.cat([attn_out, ssm_out], dim=-1)  # (bsz, seqlen, dim)
+        # === Hymba-style: normalized averaging ===
+        combined = (self.attn_avg_norm(attn_out) + self.ssm_avg_norm(ssm_out)) * 0.5
 
         return self.proj(combined)
 
