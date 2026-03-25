@@ -102,8 +102,9 @@ class Hyperparameters:
     ve_enabled = bool(int(os.environ.get("VE_ENABLED", "1")))
     ve_dim = int(os.environ.get("VE_DIM", 128))
     ve_layers = os.environ.get("VE_LAYERS", "11,12")
-    prune_layers = int(os.environ.get("PRUNE_LAYERS", 2))  # number of layers to prune after training
+    prune_layers = int(os.environ.get("PRUNE_LAYERS", 2))  # number of layers to prune
     prune_enabled = bool(int(os.environ.get("PRUNE_ENABLED", "1")))
+    prune_at_frac = float(os.environ.get("PRUNE_AT_FRAC", 0.60))  # prune at 60% of wallclock
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
     a, b, c = (3.4445, -4.7750, 2.0315)
     X = G.bfloat16()
@@ -853,8 +854,11 @@ def eval_val_sliding(
     byte_count = torch.zeros((), device=device, dtype=torch.float64)
     base_model.eval()
     compiled_logits = torch.compile(base_model.forward_logits, dynamic=False, fullgraph=True)
+    total_batches = (len(my_windows) + batch_seqs - 1) // batch_seqs
     with torch.inference_mode():
-        for bi in range(0, len(my_windows), batch_seqs):
+        for bi_idx, bi in enumerate(range(0, len(my_windows), batch_seqs)):
+            if rank == 0 and bi_idx % 20 == 0:
+                print(f"  eval_sliding: batch {bi_idx+1}/{total_batches} ({100*bi_idx/max(total_batches,1):.0f}%)", flush=True)
             batch_ws = my_windows[bi:bi + batch_seqs]
             bsz = len(batch_ws)
             x_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
@@ -950,72 +954,62 @@ def measure_block_influence(
     return bi_scores
 
 
-def prune_model_layers(
-    model: nn.Module,
+def prune_model_inplace(
+    model: "GPT",
     bi_scores: list[float],
     num_prune: int,
-) -> tuple[dict[str, Tensor], int, list[int]]:
-    """Remove lowest-BI layers from model state dict.
-    Returns a new state dict with pruned layers re-indexed.
-
-    IMPORTANT: Cannot prune first or last layer (they anchor the U-Net).
-    Only prune from middle layers (indices 1 to num_layers-2).
+    device: torch.device,
+) -> list[int]:
+    """Remove lowest-BI layers IN-PLACE using ShortGPT-style del.
+    Updates model.blocks, num_encoder/decoder_layers, skip_weights.
+    Returns list of removed layer indices.
     """
     num_layers = len(model.blocks)
     # Candidate layers for pruning: exclude first and last
     candidates = list(range(1, num_layers - 1))
-    # Sort by BI score (ascending = least important first)
     candidates.sort(key=lambda i: bi_scores[i])
-    # Select layers to prune
-    prune_set = set(candidates[:num_prune])
-    # Remaining layer indices in original order
-    keep_indices = [i for i in range(num_layers) if i not in prune_set]
-    new_num_layers = len(keep_indices)
+    layers_to_remove = sorted(candidates[:num_prune], reverse=True)  # reverse for safe deletion
 
-    # Build new state dict with re-indexed layers
-    old_sd = model.state_dict()
-    new_sd = {}
+    # Delete layers (ShortGPT style: reverse order to preserve indices)
+    for idx in layers_to_remove:
+        del model.blocks[idx]
 
-    # Re-index blocks
-    new_idx = 0
-    for old_idx in keep_indices:
-        prefix_old = f"blocks.{old_idx}."
-        prefix_new = f"blocks.{new_idx}."
-        for k, v in old_sd.items():
-            if k.startswith(prefix_old):
-                new_key = prefix_new + k[len(prefix_old):]
-                new_sd[new_key] = v
-        new_idx += 1
+    # Update U-Net encoder/decoder split
+    new_num_layers = len(model.blocks)
+    model.num_encoder_layers = new_num_layers // 2
+    model.num_decoder_layers = new_num_layers - model.num_encoder_layers
+    model.num_skip_weights = min(model.num_encoder_layers, model.num_decoder_layers)
 
-    # Copy non-block params
-    for k, v in old_sd.items():
-        if not k.startswith("blocks.") and "mtp_heads" not in k:
-            new_sd[k] = v
+    # Re-initialize skip_weights for the new layer count
+    old_skip = model.skip_weights.data
+    new_skip = torch.ones(model.num_skip_weights, old_skip.shape[1], dtype=torch.float32, device=old_skip.device)
+    # Copy as many old skip weights as fit (they won't perfectly align, but better than all-ones)
+    copy_n = min(old_skip.shape[0], new_skip.shape[0])
+    new_skip[:copy_n] = old_skip[:copy_n].float()
+    model.skip_weights = nn.Parameter(new_skip)
 
-    # Recompute skip weights for new U-Net structure
-    new_enc = new_num_layers // 2
-    new_dec = new_num_layers - new_enc
-    new_skip_count = min(new_enc, new_dec)
-    # Use uniform skip weights for pruned model
-    new_sd["skip_weights"] = torch.ones(new_skip_count, model.skip_weights.shape[1], dtype=torch.float32)
+    # Update XSA flags: apply to last xsa_last_n layers of new model
+    xsa_count = sum(1 for b in model.blocks if b.attn.use_xsa)
+    # Reset all XSA flags then set on last N layers
+    for b in model.blocks:
+        b.attn.use_xsa = False
+    for i in range(max(0, new_num_layers - xsa_count), new_num_layers):
+        model.blocks[i].attn.use_xsa = True
 
-    # Update VE layer indices if needed (they reference absolute layer indices)
-    # VE scales need to be re-mapped based on which layers survived
+    # Update VE layer indices if VE is enabled
     if model.ve_shared is not None:
-        old_ve_layers = model.ve_layer_indices
-        new_ve_layers = []
-        for old_li in old_ve_layers:
-            if old_li in keep_indices:
-                new_li = keep_indices.index(old_li)
-                new_ve_layers.append(new_li)
-        # Keep only the VE scales for surviving VE layers
-        for i, (old_li, new_li) in enumerate(zip([l for l in old_ve_layers if l in keep_indices], new_ve_layers)):
-            old_key = f"ve_layer_scales.{old_ve_layers.index(old_li)}"
-            new_key = f"ve_layer_scales.{i}"
-            if old_key in old_sd:
-                new_sd[new_key] = old_sd[old_key]
+        # Point VE to last 2 layers of new model
+        new_ve_indices = [new_num_layers - 2, new_num_layers - 1]
+        model.ve_layer_indices = new_ve_indices
+        # Re-init VE layer scales
+        old_scales = model.ve_layer_scales
+        new_scales = nn.ParameterList([
+            nn.Parameter(torch.ones(1, dtype=torch.float32, device=device))
+            for _ in new_ve_indices
+        ])
+        model.ve_layer_scales = new_scales
 
-    return new_sd, new_num_layers, keep_indices
+    return sorted(candidates[:num_prune])
 
 
 def _classify_param(name: str) -> str:
@@ -1344,6 +1338,8 @@ def main() -> None:
     ema_decay = 0.997
     training_time_ms = 0.0
     stop_after_step: int | None = None
+    pruning_done = False
+    prune_wallclock_ms = args.prune_at_frac * (args.max_wallclock_seconds * 1000.0) if args.prune_enabled else float('inf')
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     step = 0
@@ -1410,10 +1406,88 @@ def main() -> None:
         for opt in optimizers:
             opt.step()
         zero_grad_all()
+        # --- Progressive Pruning: prune during training ---
+        if args.prune_enabled and not pruning_done and args.prune_layers > 0:
+            approx_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
+            if approx_ms >= prune_wallclock_ms:
+                log0(f"progressive_prune:start step:{step} elapsed:{approx_ms:.0f}ms")
+                # 1. Measure BI on current model
+                bi_scores = measure_block_influence(base_model, val_tokens, device)
+                for i, bi in enumerate(bi_scores):
+                    log0(f"  layer_{i}_BI:{bi:.6f}")
+                # 2. Prune in-place
+                removed = prune_model_inplace(base_model, bi_scores, args.prune_layers, device)
+                new_n = len(base_model.blocks)
+                log0(f"progressive_prune:removed layers {removed}, remaining:{new_n}")
+                # 3. Unwrap DDP, recompile, re-wrap
+                compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+                model = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
+                # 4. Rebuild optimizer param groups
+                block_named_params = list(base_model.blocks.named_parameters())
+                matrix_params = [
+                    p for name, p in block_named_params
+                    if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+                ]
+                scalar_params = [
+                    p for name, p in block_named_params
+                    if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+                ]
+                scalar_params.append(base_model.skip_weights)
+                scalar_params.append(base_model.smear.gate)
+                if base_model.bigram is not None:
+                    scalar_params.append(base_model.bigram.scale)
+                tok_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
+                tok_params_list = [{"params": [base_model.tok_emb.weight], "lr": tok_lr, "base_lr": tok_lr}]
+                if base_model.bigram is not None:
+                    tok_params_list.append({"params": [base_model.bigram.embed.weight], "lr": tok_lr, "base_lr": tok_lr})
+                    if base_model.bigram.proj is not None:
+                        matrix_params.append(base_model.bigram.proj.weight)
+                if base_model.ve_shared is not None:
+                    tok_params_list.append({"params": [base_model.ve_shared.embed.weight], "lr": tok_lr, "base_lr": tok_lr})
+                    if base_model.ve_shared.proj is not None:
+                        matrix_params.append(base_model.ve_shared.proj.weight)
+                    scalar_params.append(base_model.ve_shared.scale)
+                    for s in base_model.ve_layer_scales:
+                        scalar_params.append(s)
+                optimizer_tok = torch.optim.AdamW(
+                    tok_params_list, betas=(args.beta1, args.beta2),
+                    eps=args.adam_eps, weight_decay=args.adam_wd, fused=True,
+                )
+                optimizer_muon = Muon(
+                    matrix_params, lr=args.matrix_lr, momentum=args.muon_momentum,
+                    backend_steps=args.muon_backend_steps, weight_decay=args.muon_wd,
+                )
+                for group in optimizer_muon.param_groups:
+                    group["base_lr"] = args.matrix_lr
+                optimizer_scalar = torch.optim.AdamW(
+                    [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+                    betas=(args.beta1, args.beta2), eps=args.adam_eps,
+                    weight_decay=args.adam_wd, fused=True,
+                )
+                optimizers = [optimizer_tok, optimizer_muon, optimizer_scalar]
+                if base_model.lm_head is not None:
+                    optimizer_head = torch.optim.Adam(
+                        [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
+                        betas=(args.beta1, args.beta2), eps=args.adam_eps, fused=True,
+                    )
+                    optimizers.insert(1, optimizer_head)
+                def zero_grad_all() -> None:
+                    for opt in optimizers:
+                        opt.zero_grad(set_to_none=True)
+                # 5. Reset EMA state to current pruned model
+                ema_state = {name: t.detach().float().clone() for name, t in base_model.state_dict().items()}
+                # 6. Reset SWA state
+                swa_state = None
+                swa_count = 0
+                pruning_done = True
+                log0(f"progressive_prune:done new_params:{sum(p.numel() for p in base_model.parameters())}")
+                xsa_layers = [i for i, b in enumerate(base_model.blocks) if b.attn.use_xsa]
+                log0(f"progressive_prune:XSA active_layers:{xsa_layers}")
         # EMA update
         with torch.no_grad():
             for name, t in base_model.state_dict().items():
-                ema_state[name].mul_(ema_decay).add_(t.detach().float(), alpha=1.0 - ema_decay)
+                if name in ema_state:
+                    ema_state[name].mul_(ema_decay).add_(t.detach().float(), alpha=1.0 - ema_decay)
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         if args.swa_enabled and scale < 0.2 and step % args.swa_every == 0:
@@ -1461,34 +1535,15 @@ def main() -> None:
         f"DIAGNOSTIC post_ema val_loss:{diag_val_loss:.4f} val_bpb:{diag_val_bpb:.4f} "
         f"eval_time:{1000.0 * (time.perf_counter() - t_diag):.0f}ms"
     )
-    # --- Structured Pruning ---
-    if args.prune_enabled and args.prune_layers > 0:
-        log0("measuring_block_influence...")
-        bi_scores = measure_block_influence(base_model, val_tokens, device)
-        for i, bi in enumerate(bi_scores):
-            log0(f"  layer_{i}_BI:{bi:.6f}")
-
-        pruned_sd, new_num_layers, keep_indices = prune_model_layers(base_model, bi_scores, args.prune_layers)
-        log0(f"pruned_layers:{args.prune_layers} remaining:{new_num_layers} kept:{keep_indices}")
-
-        # Create a new pruned model for eval
-        pruned_ve_layers = []
-        for li in [int(x) for x in args.ve_layers.split(",") if x.strip()]:
-            if li in keep_indices:
-                pruned_ve_layers.append(str(keep_indices.index(li)))
-        pruned_ve_str = ",".join(pruned_ve_layers) if pruned_ve_layers else ""
-
-        # Override export_sd with pruned state dict
-        export_sd = {k: v for k, v in pruned_sd.items()}
-
-        # For quantization and eval, need to create a model with the pruned architecture
-        pruned_args_num_layers = new_num_layers
-        pruned_args_ve_layers = pruned_ve_str
+    # Export: model is already pruned (if pruning was enabled) via progressive pruning during training
+    actual_num_layers = len(base_model.blocks)
+    # Compute VE layers for the current model
+    if base_model.ve_shared is not None:
+        actual_ve_layers = ",".join(str(i) for i in base_model.ve_layer_indices)
     else:
-        pruned_args_num_layers = args.num_layers
-        pruned_args_ve_layers = args.ve_layers
-        full_state_dict = base_model.state_dict()
-        export_sd = {k: v for k, v in full_state_dict.items() if "mtp_heads" not in k}
+        actual_ve_layers = args.ve_layers
+    full_state_dict = base_model.state_dict()
+    export_sd = {k: v for k, v in full_state_dict.items() if "mtp_heads" not in k}
 
     excluded_mtp = sum(int(t.numel()) for k, t in base_model.state_dict().items() if "mtp_heads" in k)
     if excluded_mtp > 0:
@@ -1523,7 +1578,7 @@ def main() -> None:
     )
     deq_state = dequantize_mixed_int6(quant_state["w"], quant_state["m"], sd_cpu)
     eval_model = GPT(
-        vocab_size=args.vocab_size, num_layers=pruned_args_num_layers, model_dim=args.model_dim,
+        vocab_size=args.vocab_size, num_layers=actual_num_layers, model_dim=args.model_dim,
         num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
         tie_embeddings=args.tie_embeddings, tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap, rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
@@ -1531,7 +1586,7 @@ def main() -> None:
         bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
         xsa_last_n=args.xsa_last_n,  # must match training model
         rope_dims=args.rope_dims, ln_scale=args.ln_scale, dtg=args.dtg_enabled,
-        ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=pruned_args_ve_layers,
+        ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=actual_ve_layers,
     ).to(device).bfloat16()
     for m in eval_model.modules():
         if isinstance(m, CastedLinear):
