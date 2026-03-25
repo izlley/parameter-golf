@@ -92,7 +92,7 @@ class Hyperparameters:
     muon_wd = float(os.environ.get("MUON_WD", 0.04))
     adam_wd = float(os.environ.get("ADAM_WD", 0.04))
     qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "0")))
-    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 6144))
+    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 8192))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
     xsa_last_n = int(os.environ.get("XSA_LAST_N", 4))  # XSA on last 4 layers (0 = disabled)
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
@@ -101,11 +101,8 @@ class Hyperparameters:
     late_qat_threshold = float(os.environ.get("LATE_QAT_THRESHOLD", 0.15))
     ve_enabled = bool(int(os.environ.get("VE_ENABLED", "1")))
     ve_dim = int(os.environ.get("VE_DIM", 128))
+    gated_attention = bool(int(os.environ.get("GATED_ATTENTION", "1")))
     ve_layers = os.environ.get("VE_LAYERS", "9,10")
-    hymba_enabled = bool(int(os.environ.get("HYMBA_ENABLED", "1")))
-    hymba_ssm_heads = int(os.environ.get("HYMBA_SSM_HEADS", 4))  # number of heads that use SSM instead of attention
-    hymba_d_state = int(os.environ.get("HYMBA_D_STATE", 16))      # SSM state dimension per head
-    hymba_d_conv = int(os.environ.get("HYMBA_D_CONV", 4))         # conv1d kernel size for SSM
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
     a, b, c = (3.4445, -4.7750, 2.0315)
     X = G.bfloat16()
@@ -265,7 +262,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear,dtg_gate,ve_layer_scales,ve_shared.scale,A_log,.ssm.D,dt_proj",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,smear,dtg_gate,ve_layer_scales,ve_shared.scale",
     ).split(",")
     if pattern
 )
@@ -493,188 +490,6 @@ def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor, rope_dims: int = 0) ->
     half = x.size(-1) // 2
     x1, x2 = x[..., :half], x[..., half:]
     return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
-class SSMHead(nn.Module):
-    """Simple SSM head for Hymba hybrid attention.
-    Pure PyTorch recurrent scan, torch.compile(fullgraph=True) compatible.
-    Inspired by NVlabs/hymba: LayerNorm on B/C/dt for numerical stability.
-    """
-    def __init__(self, ssm_dim: int, d_state: int = 16, d_conv: int = 4):
-        super().__init__()
-        self.ssm_dim = ssm_dim
-        self.d_state = d_state
-        # Conv1d for local context
-        self.conv1d = nn.Conv1d(ssm_dim, ssm_dim, d_conv, padding=d_conv - 1, groups=ssm_dim, bias=True)
-        nn.init.zeros_(self.conv1d.bias)
-        # SSM projections: B, C, and dt from same projection (like Hymba)
-        self.x_proj = nn.Linear(ssm_dim, d_state * 2 + 1, bias=False)
-        nn.init.normal_(self.x_proj.weight, std=0.01)
-        # LayerNorm on B, C, dt for stability (Hymba-style)
-        self.B_norm = nn.LayerNorm(d_state)
-        self.C_norm = nn.LayerNorm(d_state)
-        self.dt_norm = nn.LayerNorm(1)
-        # dt bias (learned, initialized small)
-        self.dt_bias = nn.Parameter(torch.full((1,), -3.0))
-        # A parameter (diagonal, real, negative for stability)
-        A = -torch.arange(1, d_state + 1, dtype=torch.float32)
-        self.A_log = nn.Parameter(torch.log(-A))  # log for numerical stability
-        self.D = nn.Parameter(torch.ones(ssm_dim))
-        # Output gate
-        self.out_gate = nn.Linear(ssm_dim, ssm_dim, bias=False)
-        nn.init.ones_(self.out_gate.weight)
-
-    def _simple_recurrent_scan(self, x_conv: Tensor, dA: Tensor, dB: Tensor, C_t: Tensor) -> Tensor:
-        """Simple step-by-step recurrent SSM scan. Numerically stable (no exp/log tricks).
-        x_conv: (B, T, D), dA: (B, T, N), dB: (B, T, N), C_t: (B, T, N)
-        Returns: (B, T, D)
-        """
-        B, T, D = x_conv.shape
-        N = dA.shape[-1]
-        h = torch.zeros(B, D, N, device=x_conv.device, dtype=x_conv.dtype)
-        outputs = []
-        for t in range(T):
-            # h = dA[t] * h + dB[t] * x[t]
-            h = dA[:, t, :].unsqueeze(1) * h + \
-                x_conv[:, t, :].unsqueeze(-1) * dB[:, t, :].unsqueeze(1)  # (B, D, N)
-            # y[t] = sum_n C[t,n] * h[:,n]
-            y_t = (h * C_t[:, t, :].unsqueeze(1)).sum(-1)  # (B, D)
-            outputs.append(y_t)
-        return torch.stack(outputs, dim=1)  # (B, T, D)
-
-    def forward(self, x: Tensor) -> Tensor:
-        """x: (batch, seq_len, ssm_dim) -> (batch, seq_len, ssm_dim)"""
-        bsz, seq_len, dim = x.shape
-
-        # Conv1d (stays in input dtype)
-        x_conv = self.conv1d(x.transpose(1, 2))[:, :, :seq_len].transpose(1, 2)
-        x_conv = F.silu(x_conv)
-
-        # SSM parameter projection + LayerNorm (Hymba-style stability)
-        BCdt = self.x_proj(x_conv)  # (B, T, 2*d_state + 1)
-        B_t = self.B_norm(BCdt[..., :self.d_state]).float()
-        C_t = self.C_norm(BCdt[..., self.d_state:2*self.d_state]).float()
-        dt_raw = self.dt_norm(BCdt[..., 2*self.d_state:])  # (B, T, 1)
-
-        dt = F.softplus(dt_raw.float() + self.dt_bias.float()).clamp(min=1e-4, max=5.0)
-        A = -torch.exp(self.A_log.float())  # (d_state,) negative real
-
-        # Discretize: dA = exp(A * dt), dB = dt * B
-        dA = torch.exp(A[None, None, :] * dt)  # (B, T, d_state), always in (0, 1]
-        dB = dt * B_t  # (B, T, d_state)
-
-        # Simple recurrent scan (numerically stable, no log-space tricks)
-        y = self._simple_recurrent_scan(x_conv.float(), dA, dB, C_t)
-
-        # Add skip connection with D parameter
-        y = y + self.D.float()[None, None, :] * x_conv.float()
-
-        # Cast back to input dtype
-        y = y.to(x.dtype)
-
-        # Gated output (in input dtype)
-        gate = torch.sigmoid(self.out_gate(x))
-        y = gate * y
-
-        return y
-
-
-class HybridAttention(nn.Module):
-    """Hymba-style: split heads into attention heads and SSM heads.
-    Attention heads use GQA with RoPE; SSM heads use a parallel-scan SSM.
-    Both operate in parallel on the same input, outputs are concatenated."""
-    def __init__(
-        self,
-        dim: int,
-        num_heads: int,
-        num_kv_heads: int,
-        num_ssm_heads: int,
-        rope_base: float,
-        qk_gain_init: float,
-        d_state: int = 16,
-        d_conv: int = 4,
-    ):
-        super().__init__()
-        self.num_heads = num_heads
-        self.num_ssm_heads = num_ssm_heads
-        self.num_attn_heads = num_heads - num_ssm_heads
-        self.head_dim = dim // num_heads
-        self.dim = dim
-
-        # Attention heads (fewer than before)
-        attn_dim = self.num_attn_heads * self.head_dim
-        attn_kv_heads = max(1, num_kv_heads * self.num_attn_heads // num_heads)  # proportional KV heads
-        self.attn_kv_heads = attn_kv_heads
-        kv_dim = attn_kv_heads * self.head_dim
-
-        self.c_q = CastedLinear(dim, attn_dim, bias=False)
-        self.c_k = CastedLinear(dim, kv_dim, bias=False)
-        self.c_v = CastedLinear(dim, kv_dim, bias=False)
-
-        # SSM heads
-        ssm_dim = self.num_ssm_heads * self.head_dim
-        self.ssm_proj_in = CastedLinear(dim, ssm_dim, bias=False)
-        self.ssm = SSMHead(ssm_dim, d_state=d_state, d_conv=d_conv)
-        self.attn_proj_up = CastedLinear(attn_dim, dim, bias=False)  # project attn to full dim
-        self.ssm_proj_out = CastedLinear(ssm_dim, dim, bias=False)  # project SSM to full dim
-
-        # Hymba-style: LayerNorm before averaging attn and SSM
-        self.attn_avg_norm = nn.LayerNorm(dim)
-        self.ssm_avg_norm = nn.LayerNorm(dim)
-
-        # Output projection (now from dim, not concat)
-        self.proj = CastedLinear(dim, dim, bias=False)
-        self.proj._zero_init = True
-
-        # Attention-specific params (same as CausalSelfAttention)
-        self.q_gain = nn.Parameter(torch.full((self.num_attn_heads,), qk_gain_init, dtype=torch.float32))
-        self.rope_dims = 0  # set by GPT.__init__ for partial RoPE
-        self.rotary = Rotary(self.head_dim, base=rope_base, train_seq_len=1024)
-        self.use_xsa = False  # set by GPT.__init__ for deep layers only
-
-    def _xsa_efficient(self, y: Tensor, v: Tensor) -> Tensor:
-        """Efficient XSA: subtract self-value projection via GQA-aware reshape."""
-        B, T, H, D = y.shape
-        Hkv = v.size(-2)
-        group = H // Hkv
-        y_g = y.reshape(B, T, Hkv, group, D)
-        vn = F.normalize(v, dim=-1).unsqueeze(-2)
-        proj = (y_g * vn).sum(dim=-1, keepdim=True) * vn
-        return (y_g - proj).reshape(B, T, H, D)
-
-    def forward(self, x: Tensor, v_embed: Tensor | None = None) -> Tensor:
-        bsz, seqlen, dim = x.shape
-
-        # === Attention path ===
-        q = self.c_q(x).reshape(bsz, seqlen, self.num_attn_heads, self.head_dim)
-        k = self.c_k(x).reshape(bsz, seqlen, self.attn_kv_heads, self.head_dim)
-        v = self.c_v(x)
-        if v_embed is not None:
-            v = v + v_embed
-        v = v.reshape(bsz, seqlen, self.attn_kv_heads, self.head_dim)
-
-        q = F.rms_norm(q, (q.size(-1),))
-        k = F.rms_norm(k, (k.size(-1),))
-        cos, sin = self.rotary(seqlen, x.device, q.dtype)
-        q = apply_rotary_emb(q, cos, sin, self.rope_dims)
-        k = apply_rotary_emb(k, cos, sin, self.rope_dims)
-        q = q * self.q_gain.to(dtype=q.dtype)[None, None, :, None]
-        attn_out = flash_attn_3_func(q, k, v, causal=True)
-
-        if self.use_xsa:
-            attn_out = self._xsa_efficient(attn_out, v)
-
-        attn_out = attn_out.reshape(bsz, seqlen, self.num_attn_heads * self.head_dim)
-        attn_out = self.attn_proj_up(attn_out)  # (bsz, seqlen, dim)
-
-        # === SSM path ===
-        ssm_in = self.ssm_proj_in(x)
-        ssm_out = self.ssm_proj_out(self.ssm(ssm_in))  # (bsz, seqlen, dim)
-
-        # === Hymba-style: normalized averaging ===
-        combined = (self.attn_avg_norm(attn_out) + self.ssm_avg_norm(ssm_out)) * 0.5
-
-        return self.proj(combined)
-
-
 class CausalSelfAttention(nn.Module):
     def __init__(
         self,
@@ -683,6 +498,7 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
+        gated_attention: bool = False,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -704,6 +520,12 @@ class CausalSelfAttention(nn.Module):
         self.rope_dims = 0  # set by GPT.__init__ for partial RoPE
         self.rotary = Rotary(self.head_dim, base=rope_base, train_seq_len=1024)
         self.use_xsa = False  # set by GPT.__init__ for deep layers only
+        # Per-head gated attention (SOTA#2 style): ~4K params, identity-init
+        self.gated_attention = gated_attention
+        if gated_attention:
+            self.attn_gate = nn.Linear(dim, num_heads, bias=True)
+            nn.init.zeros_(self.attn_gate.weight)
+            nn.init.constant_(self.attn_gate.bias, 4.0)
     def _xsa_efficient(self, y: Tensor, v: Tensor) -> Tensor:
         """Efficient XSA: subtract self-value projection via GQA-aware reshape (no repeat_interleave).
         y: [B, T, H, D], v: [B, T, Hkv, D]. H must be divisible by Hkv."""
@@ -731,6 +553,9 @@ class CausalSelfAttention(nn.Module):
         y = flash_attn_3_func(q, k, v, causal=True)
         if self.use_xsa:
             y = self._xsa_efficient(y, v)
+        if self.gated_attention:
+            gate = torch.sigmoid(self.attn_gate(x)).unsqueeze(-1)  # (bsz, seqlen, num_heads, 1)
+            y = y * gate
         y = y.reshape(bsz, seqlen, dim)
         return self.proj(y)
 class SmearGate(nn.Module):
@@ -801,21 +626,12 @@ class Block(nn.Module):
         layer_idx: int = 0,
         ln_scale: bool = False,
         dtg: bool = False,
-        hymba: bool = False,
-        hymba_ssm_heads: int = 4,
-        hymba_d_state: int = 16,
-        hymba_d_conv: int = 4,
+        gated_attention: bool = False,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        if hymba:
-            self.attn = HybridAttention(
-                dim, num_heads, num_kv_heads, hymba_ssm_heads,
-                rope_base, qk_gain_init, hymba_d_state, hymba_d_conv,
-            )
-        else:
-            self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, gated_attention=gated_attention)
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -862,19 +678,10 @@ class GPT(nn.Module):
         ve_enabled: bool = False,
         ve_dim: int = 128,
         ve_layers: str = "9,10",
-        hymba_enabled: bool = False,
-        hymba_ssm_heads: int = 4,
-        hymba_d_state: int = 16,
-        hymba_d_conv: int = 4,
+        gated_attention: bool = False,
     ):
         super().__init__()
-        self.hymba_enabled = hymba_enabled
-        self.hymba_ssm_heads = hymba_ssm_heads
-        if hymba_enabled:
-            attn_kv_heads = max(1, num_kv_heads * (num_heads - hymba_ssm_heads) // num_heads)
-        else:
-            attn_kv_heads = num_kv_heads
-        self._ve_target_dim = attn_kv_heads * (model_dim // num_heads)  # kv_dim for value projection
+        self._ve_target_dim = num_kv_heads * (model_dim // num_heads)  # kv_dim for value projection
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
         self.tie_embeddings = tie_embeddings
@@ -901,10 +708,7 @@ class GPT(nn.Module):
                     layer_idx=i,
                     ln_scale=ln_scale,
                     dtg=dtg,
-                    hymba=hymba_enabled,
-                    hymba_ssm_heads=hymba_ssm_heads,
-                    hymba_d_state=hymba_d_state,
-                    hymba_d_conv=hymba_d_conv,
+                    gated_attention=gated_attention,
                 )
                 for i in range(num_layers)
             ]
@@ -1061,11 +865,8 @@ def eval_val_sliding(
     byte_count = torch.zeros((), device=device, dtype=torch.float64)
     base_model.eval()
     compiled_logits = torch.compile(base_model.forward_logits, dynamic=False, fullgraph=True)
-    total_batches = (len(my_windows) + batch_seqs - 1) // batch_seqs
     with torch.inference_mode():
-        for bi_idx, bi in enumerate(range(0, len(my_windows), batch_seqs)):
-            if rank == 0 and bi_idx % 20 == 0:
-                print(f"  eval_sliding: batch {bi_idx+1}/{total_batches} ({100*bi_idx/max(total_batches,1):.0f}%)", flush=True)
+        for bi in range(0, len(my_windows), batch_seqs):
             batch_ws = my_windows[bi:bi + batch_seqs]
             bsz = len(batch_ws)
             x_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
@@ -1128,9 +929,6 @@ def quantize_int6_per_row(t: Tensor, clip_range: int = 31) -> tuple[Tensor, Tens
             err = (t32 - recon).pow(2).mean().item()
             if err < best_err:
                 best_q, best_s, best_err = q, s, err
-        if best_q is None:
-            # Fallback: use last computed q, s
-            best_q, best_s = q, s
         return best_q, best_s
     amax = t32.abs().max().item()
     scale = torch.tensor(amax / clip_range if amax > 0 else 1.0, dtype=torch.float16)
@@ -1180,14 +978,7 @@ def dequantize_mixed_int6(result: dict[str, Tensor], meta: dict[str, object],
                 t = t.to(orig_dtype)
             out[name] = t
             continue
-        q = result.get(name + ".q")
-        s = result.get(name + ".scale")
-        if q is None or s is None:
-            # Fallback: key exists in meta but not in result (e.g. shape mismatch)
-            print(f"WARNING dequantize: missing q/scale for {name}, q={q is not None} s={s is not None}")
-            if name in result:
-                out[name] = result[name].to(orig_dtype)
-            continue
+        q, s = result[name + ".q"], result[name + ".scale"]
         if s.ndim > 0:
             out[name] = (q.float() * s.float().view(q.shape[0], *([1] * (q.ndim - 1)))).to(orig_dtype)
         else:
@@ -1304,10 +1095,7 @@ def main() -> None:
         ve_enabled=args.ve_enabled,
         ve_dim=args.ve_dim,
         ve_layers=args.ve_layers,
-        hymba_enabled=args.hymba_enabled,
-        hymba_ssm_heads=args.hymba_ssm_heads,
-        hymba_d_state=args.hymba_d_state,
-        hymba_d_conv=args.hymba_d_conv,
+        gated_attention=args.gated_attention,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1326,7 +1114,7 @@ def main() -> None:
     scalar_params = [
         p
         for name, p in block_named_params
-        if p.ndim != 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
@@ -1384,11 +1172,10 @@ def main() -> None:
     log0(f"mtp_num_heads:{args.mtp_num_heads} mtp_loss_weight:{args.mtp_loss_weight} mtp_params:{mtp_params}")
     xsa_layers = [i for i, b in enumerate(base_model.blocks) if b.attn.use_xsa]
     log0(f"XSA:last_{args.xsa_last_n} active_layers:{xsa_layers}")
-    log0(f"hymba:enabled={args.hymba_enabled} ssm_heads={args.hymba_ssm_heads} d_state={args.hymba_d_state} d_conv={args.hymba_d_conv}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_backend:{'flash_attn_3' if _USE_FA3 else 'sdpa_fallback'}")
-    log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads} gated_attention:{args.gated_attention}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
@@ -1607,8 +1394,7 @@ def main() -> None:
         xsa_last_n=args.xsa_last_n,  # must match training model
         rope_dims=args.rope_dims, ln_scale=args.ln_scale, dtg=args.dtg_enabled,
         ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
-        hymba_enabled=args.hymba_enabled, hymba_ssm_heads=args.hymba_ssm_heads,
-        hymba_d_state=args.hymba_d_state, hymba_d_conv=args.hymba_d_conv,
+        gated_attention=args.gated_attention,
     ).to(device).bfloat16()
     for m in eval_model.modules():
         if isinstance(m, CastedLinear):
