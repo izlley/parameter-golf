@@ -1338,7 +1338,7 @@ def main() -> None:
     mtp_params = sum(p.numel() for p in base_model.mtp_heads.parameters())
     log0(f"model_params:{n_params}")
     log0(f"mtp_num_heads:{args.mtp_num_heads} mtp_loss_weight:{args.mtp_loss_weight} mtp_params:{mtp_params}")
-    xsa_layers = [i for i, b in enumerate(base_model.blocks) if b.attn.use_xsa]
+    xsa_layers = [i for i, b in enumerate(base_model.blocks) if hasattr(b, 'attn') and b.attn.use_xsa]
     log0(f"XSA:last_{args.xsa_last_n} active_layers:{xsa_layers}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
