@@ -103,7 +103,7 @@ class Hyperparameters:
     ve_dim = int(os.environ.get("VE_DIM", 128))
     ve_layers = os.environ.get("VE_LAYERS", "9,10")
     saliency_top_pct = float(os.environ.get("SALIENCY_TOP_PCT", 0.01))  # top 1% salient weights kept as fp16
-    saliency_low_bits = int(os.environ.get("SALIENCY_LOW_BITS", 4))     # quantize non-salient to int4
+    saliency_low_bits = int(os.environ.get("SALIENCY_LOW_BITS", 6))     # quantize non-salient to int6 (matches QAT)
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
     a, b, c = (3.4445, -4.7750, 2.0315)
     X = G.bfloat16()
@@ -922,7 +922,7 @@ def quantize_int6_per_row(t: Tensor, clip_range: int = 31) -> tuple[Tensor, Tens
     scale = torch.tensor(amax / clip_range if amax > 0 else 1.0, dtype=torch.float16)
     q = torch.clamp(torch.round(t32 / scale.float()), -clip_range, clip_range).to(torch.int8)
     return q, scale
-def quantize_saliency_mixed_per_row(t: Tensor, top_pct: float = 0.01, low_bits: int = 4) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+def quantize_saliency_mixed_per_row(t: Tensor, top_pct: float = 0.01, low_bits: int = 6) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     """Saliency-based mixed precision: top_pct weights kept as fp16, rest quantized to low_bits.
     Returns (q_low: int8, scale_low: fp16, salient_vals: fp16, salient_indices: int32).
     """
@@ -973,7 +973,7 @@ def quantize_saliency_mixed_per_row(t: Tensor, top_pct: float = 0.01, low_bits: 
     return q, scale, salient_vals, salient_indices
 def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str],
                         saliency_cats: set[str] | None = None, saliency_top_pct: float = 0.01,
-                        saliency_low_bits: int = 4):
+                        saliency_low_bits: int = 6):
     num_layers_total = max(
         (int(k.split(".")[1]) for k in state_dict if k.startswith("blocks.")),
         default=0,

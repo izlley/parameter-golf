@@ -103,8 +103,8 @@ class Hyperparameters:
     ve_dim = int(os.environ.get("VE_DIM", 128))
     ve_layers = os.environ.get("VE_LAYERS", "9,10")
     # Hybrid SSM+Attn: comma-separated layer indices to replace with Mamba2
-    mamba_layers = os.environ.get("MAMBA_LAYERS", "0,1,2")
-    mamba_d_state = int(os.environ.get("MAMBA_D_STATE", 64))
+    mamba_layers = os.environ.get("MAMBA_LAYERS", "0")
+    mamba_d_state = int(os.environ.get("MAMBA_D_STATE", 16))
     mamba_d_conv = int(os.environ.get("MAMBA_D_CONV", 4))
     mamba_expand = int(os.environ.get("MAMBA_EXPAND", 2))
     mamba_chunk_size = int(os.environ.get("MAMBA_CHUNK_SIZE", 64))

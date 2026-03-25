@@ -1,0 +1,116 @@
+W0325 01:53:48.679000 633047 torch/distributed/run.py:851] 
+W0325 01:53:48.679000 633047 torch/distributed/run.py:851] *****************************************
+W0325 01:53:48.679000 633047 torch/distributed/run.py:851] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W0325 01:53:48.679000 633047 torch/distributed/run.py:851] *****************************************
+[W325 01:53:52.498465077 socket.cpp:764] [c10d] The client socket cannot be initialized to connect to [localhost]:40939 (errno: 97 - Address family not supported by protocol).
+[W325 01:53:52.503576045 socket.cpp:764] [c10d] The client socket cannot be initialized to connect to [::ffff:127.0.0.1]:40939 (errno: 97 - Address family not supported by protocol).
+[W325 01:53:52.506734693 socket.cpp:764] [c10d] The client socket cannot be initialized to connect to [::ffff:127.0.0.1]:40939 (errno: 97 - Address family not supported by protocol).
+[W325 01:53:52.796411540 socket.cpp:764] [c10d] The client socket cannot be initialized to connect to [::ffff:198.18.98.203]:40113 (errno: 97 - Address family not supported by protocol).
+[W325 01:54:00.481831330 socket.cpp:764] [c10d] The client socket cannot be initialized to connect to [::ffff:198.18.98.203]:40113 (errno: 97 - Address family not supported by protocol).
+[W325 01:54:00.612333961 socket.cpp:764] [c10d] The client socket cannot be initialized to connect to [::ffff:198.18.98.203]:40113 (errno: 97 - Address family not supported by protocol).
+[W325 01:54:00.002291528 socket.cpp:764] [c10d] The client socket cannot be initialized to connect to [::ffff:198.18.98.203]:40113 (errno: 97 - Address family not supported by protocol).
+[W325 01:54:00.038602546 socket.cpp:764] [c10d] The client socket cannot be initialized to connect to [::ffff:198.18.98.203]:40113 (errno: 97 - Address family not supported by protocol).
+[W325 01:54:00.044301139 socket.cpp:764] [c10d] The client socket cannot be initialized to connect to [::ffff:198.18.98.203]:40113 (errno: 97 - Address family not supported by protocol).
+[W325 01:54:00.045091201 socket.cpp:764] [c10d] The client socket cannot be initialized to connect to [::ffff:198.18.98.203]:40113 (errno: 97 - Address family not supported by protocol).
+[W325 01:54:00.046593258 socket.cpp:764] [c10d] The client socket cannot be initialized to connect to [::ffff:198.18.98.203]:40113 (errno: 97 - Address family not supported by protocol).
+[W325 01:54:00.050109125 socket.cpp:764] [c10d] The client socket cannot be initialized to connect to [::ffff:198.18.98.203]:40113 (errno: 97 - Address family not supported by protocol).
+logs/fb9210f1-5a37-476e-812c-7281b8e8aa0b.txt
+wandb: [wandb.login()] Loaded credentials for https://api.wandb.ai from WANDB_API_KEY.
+wandb: Currently logged in as: gluon to https://api.wandb.ai. Use `wandb login --relogin` to force relogin
+wandb: setting up run u8il0qqe
+wandb: Tracking run with wandb version 0.25.1
+wandb: Run data is saved locally in /home1/irteam/work/home/izlley/my-parameter-golf/records/track_10min_16mb/2026-03-25_0500_11L_DDP_Free/wandb/run-20260325_015404-u8il0qqe
+wandb: Run `wandb offline` to turn off syncing.
+wandb: Syncing run 2026-03-25_0500_11L_DDP_Free_seed1337
+wandb: ⭐️ View project at https://wandb.ai/gluon/parameter-golf
+wandb: 🚀 View run at https://wandb.ai/gluon/parameter-golf/runs/u8il0qqe
+val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path=/home1/irteam/work/home/izlley/my-parameter-golf/data/tokenizers/fineweb_1024_bpe.model
+train_loader:dataset:fineweb10B_sp1024 train_shards:80
+val_loader:shards pattern=/home1/irteam/work/home/izlley/my-parameter-golf/data/datasets/fineweb10B_sp1024/fineweb_val_*.bin tokens:62021632
+model_params:27518044
+mtp_num_heads:0 mtp_loss_weight:0.2 mtp_params:0
+XSA:last_4 active_layers:[7, 8, 9, 10]
+world_size:8 grad_accum_steps:1
+sdp_backends:cudnn=False flash=True mem_efficient=False math=False
+attention_backend:flash_attn_3
+attention_mode:gqa num_heads:8 num_kv_heads:4
+tie_embeddings:True embed_lr:0.035 head_lr:0.0 matrix_lr:0.025 scalar_lr:0.025
+train_batch_tokens:786432 train_seq_len:2048 iterations:20000 warmup_steps:20 max_wallclock_seconds:600.000
+seed:1337
+warmup_step:1/20
+warmup_step:2/20
+warmup_step:3/20
+warmup_step:4/20
+warmup_step:5/20
+warmup_step:6/20
+warmup_step:7/20
+warmup_step:8/20
+warmup_step:9/20
+warmup_step:10/20
+warmup_step:11/20
+warmup_step:12/20
+warmup_step:13/20
+warmup_step:14/20
+warmup_step:15/20
+warmup_step:16/20
+warmup_step:17/20
+warmup_step:18/20
+warmup_step:19/20
+warmup_step:20/20
+step:0/20000 val_loss:6.9297 val_bpb:4.1041 train_time:0ms step_avg:0.02ms
+step:1/20000 train_loss:6.9321 train_time:151ms step_avg:150.51ms
+step:2/20000 train_loss:8.7943 train_time:235ms step_avg:117.67ms
+step:3/20000 train_loss:7.9205 train_time:325ms step_avg:108.48ms
+step:4/20000 train_loss:7.2119 train_time:415ms step_avg:103.74ms
+step:5/20000 train_loss:6.9544 train_time:505ms step_avg:100.95ms
+step:6/20000 train_loss:6.9164 train_time:595ms step_avg:99.21ms
+step:7/20000 train_loss:6.8005 train_time:685ms step_avg:97.79ms
+step:8/20000 train_loss:6.7081 train_time:774ms step_avg:96.76ms
+step:9/20000 train_loss:6.3337 train_time:863ms step_avg:95.91ms
+step:10/20000 train_loss:6.0428 train_time:953ms step_avg:95.26ms
+step:500/20000 train_loss:3.8768 train_time:45815ms step_avg:91.63ms
+step:500/20000 val_loss:3.8438 val_bpb:2.2765 train_time:45821ms step_avg:91.64ms
+step:1000/20000 train_loss:3.7748 train_time:92152ms step_avg:92.15ms
+step:1000/20000 val_loss:3.7757 val_bpb:2.2362 train_time:92158ms step_avg:92.16ms
+step:1500/20000 train_loss:3.7018 train_time:138490ms step_avg:92.33ms
+step:1500/20000 val_loss:3.8955 val_bpb:2.3071 train_time:138496ms step_avg:92.33ms
+step:2000/20000 train_loss:3.6564 train_time:184630ms step_avg:92.32ms
+step:2000/20000 val_loss:3.6953 val_bpb:2.1886 train_time:184636ms step_avg:92.32ms
+step:2500/20000 train_loss:3.8042 train_time:230636ms step_avg:92.25ms
+step:2500/20000 val_loss:3.8136 val_bpb:2.2586 train_time:230641ms step_avg:92.26ms
+step:3000/20000 train_loss:3.6986 train_time:276653ms step_avg:92.22ms
+step:3000/20000 val_loss:3.7319 val_bpb:2.2103 train_time:276659ms step_avg:92.22ms
+step:3500/20000 train_loss:4.0826 train_time:322631ms step_avg:92.18ms
+step:3500/20000 val_loss:3.9740 val_bpb:2.3536 train_time:322637ms step_avg:92.18ms
+step:4000/20000 train_loss:3.8114 train_time:368615ms step_avg:92.15ms
+step:4000/20000 val_loss:3.8244 val_bpb:2.2650 train_time:368621ms step_avg:92.16ms
+step:4500/20000 train_loss:3.7763 train_time:414610ms step_avg:92.14ms
+step:4500/20000 val_loss:3.8229 val_bpb:2.2641 train_time:414616ms step_avg:92.14ms
+step:5000/20000 train_loss:3.8879 train_time:460578ms step_avg:92.12ms
+step:5000/20000 val_loss:3.9202 val_bpb:2.3218 train_time:460584ms step_avg:92.12ms
+step:5500/20000 train_loss:3.5770 train_time:506501ms step_avg:92.09ms
+step:5500/20000 val_loss:3.5981 val_bpb:2.1310 train_time:506507ms step_avg:92.09ms
+swa:start step:5850
+late_qat:enabled step:5991 scale:0.1498
+step:6000/20000 train_loss:3.5718 train_time:552536ms step_avg:92.09ms
+step:6000/20000 val_loss:3.6300 val_bpb:2.1499 train_time:552570ms step_avg:92.10ms
+step:6500/20000 train_loss:3.6905 train_time:598654ms step_avg:92.10ms
+step:6500/20000 val_loss:3.6299 val_bpb:2.1499 train_time:598682ms step_avg:92.10ms
+step:6515/20000 val_loss:3.6289 val_bpb:2.1492 train_time:600048ms step_avg:92.10ms
+stopping_early: wallclock_cap train_time:600048ms step:6515/20000
+peak memory allocated: 21531 MiB reserved: 21858 MiB
+ema:applying EMA weights
+DIAGNOSTIC post_ema val_loss:4.1319 val_bpb:2.4472 eval_time:2069ms
+Serialized model: 107227145 bytes
+Code size: 69536 bytes
+Serialized model int6+zstd: 6017676 bytes
+Total submission size int6+zstd: 6087212 bytes
+Total submission size int8+zlib: 6087212 bytes
+final_int6_roundtrip val_loss:3.7758 val_bpb:2.2362 eval_time:6312ms
+final_int6_roundtrip_exact val_loss:3.77577957 val_bpb:2.23622934
+final_int6_sliding_window val_loss:3.7671 val_bpb:2.2311 stride:64 eval_time:72033ms
+final_int6_sliding_window_exact val_loss:3.76714740 val_bpb:2.23112279
+final_int8_zlib_roundtrip_exact val_loss:3.76714740 val_bpb:2.23112279
+[1;34mwandb[0m: 
+[1;34mwandb[0m: 🚀 View run [33m2026-03-25_0500_11L_DDP_Free_seed1337[0m at: [34mhttps://wandb.ai/gluon/parameter-golf/runs/u8il0qqe[0m
+[1;34mwandb[0m: Find logs at: [1;35mwandb/run-20260325_015404-u8il0qqe/logs[0m

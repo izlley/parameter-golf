@@ -1387,7 +1387,13 @@ def main() -> None:
     # Apply EMA weights (better than SWA alone per PR#401)
     log0("ema:applying EMA weights")
     current_state = base_model.state_dict()
-    avg_state = {name: t.to(dtype=current_state[name].dtype) for name, t in ema_state.items()}
+    avg_state = {}
+    for name, t in ema_state.items():
+        if args.ternary_mlp and ".mlp." in name and t.ndim == 2:
+            # Use raw training weights for ternary MLP layers (EMA destroys ternary structure)
+            avg_state[name] = current_state[name].float()
+        else:
+            avg_state[name] = t.to(dtype=current_state[name].dtype)
     base_model.load_state_dict(avg_state, strict=True)
     torch.cuda.synchronize()
     t_diag = time.perf_counter()
