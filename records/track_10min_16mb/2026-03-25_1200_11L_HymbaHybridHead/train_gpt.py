@@ -571,8 +571,13 @@ class SSMHead(nn.Module):
 
         return torch.cat(outputs, dim=1)  # (B, T, D)
 
+    @torch.autocast(device_type="cuda", enabled=False)
     def forward(self, x: Tensor) -> Tensor:
-        """x: (batch, seq_len, ssm_dim) -> (batch, seq_len, ssm_dim)"""
+        """x: (batch, seq_len, ssm_dim) -> (batch, seq_len, ssm_dim)
+        Forces float32 — SSM scan accumulation is numerically unstable in bfloat16.
+        """
+        orig_dtype = x.dtype
+        x = x.float()
         bsz, seq_len, dim = x.shape
 
         # Conv1d
@@ -601,7 +606,7 @@ class SSMHead(nn.Module):
         gate = torch.sigmoid(self.out_gate(x))
         y = gate * y
 
-        return y
+        return y.to(orig_dtype)
 
 
 class HybridAttention(nn.Module):
