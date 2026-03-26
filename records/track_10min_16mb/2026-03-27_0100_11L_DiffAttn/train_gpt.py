@@ -562,7 +562,7 @@ class CausalSelfAttention(nn.Module):
         # Reshape back: [B, T, 2*H, D/2] -> [B, T, H, 2, D/2]
         y_paired = y_double.reshape(bsz, seqlen, self.num_heads, 2, half_d)
         # Differential: y1 - λ * y2 (noise cancellation)
-        lam = torch.sigmoid(self.diff_lambda).to(dtype=y_paired.dtype)[None, None, :, None, None]
+        lam = torch.sigmoid(self.diff_lambda).to(dtype=y_paired.dtype)[None, None, :, None]
         y_diff = y_paired[:, :, :, 0, :] - lam * y_paired[:, :, :, 1, :]
         # Combine diff and sum to restore full head_dim
         y_sum = y_paired[:, :, :, 0, :] + y_paired[:, :, :, 1, :]
