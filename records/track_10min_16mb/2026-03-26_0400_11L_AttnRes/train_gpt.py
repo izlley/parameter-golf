@@ -716,7 +716,8 @@ class GPT(nn.Module):
             self.num_encoder_layers = 0
             self.num_decoder_layers = num_layers
             self.num_skip_weights = 0
-            self.skip_weights = nn.Parameter(torch.empty(0, dtype=torch.float32))
+            # Register as buffer (not parameter) so DDP doesn't expect gradients
+            self.register_buffer('skip_weights', torch.empty(0, dtype=torch.float32))
             self.attn_res_ops = nn.ModuleList([AttnResOp(model_dim) for _ in range(num_layers)])
         else:
             self.num_encoder_layers = num_layers // 2
