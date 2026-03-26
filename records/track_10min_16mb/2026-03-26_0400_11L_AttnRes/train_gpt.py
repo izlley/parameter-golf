@@ -437,20 +437,15 @@ class AttnResOp(nn.Module):
     previous layer outputs. pseudo_query is zero-initialized so it starts
     as uniform averaging (equivalent to standard residual stream).
 
-    For torch.compile compatibility, always receives the full (L+1, B, T, d)
-    buffer and a mask of shape (L+1,) indicating valid sources."""
+    Receives a stacked tensor of sources (no in-place mutation)."""
     def __init__(self, d_model: int, eps: float = 1e-6):
         super().__init__()
         self.pseudo_query = nn.Parameter(torch.zeros(d_model))
         self.eps = eps
-    def forward(self, sources: Tensor, mask: Tensor) -> Tensor:
-        """sources: (L+1, B, T, d), mask: (L+1,) bool -> output: (B, T, d)"""
-        # RMSNorm without learnable weight on keys
+    def forward(self, sources: Tensor) -> Tensor:
+        """sources: (N_src, B, T, d) -> output: (B, T, d)"""
         K = F.rms_norm(sources, (sources.size(-1),), eps=self.eps)
-        # logits: (L+1, B, T) via einsum with pseudo_query
         logits = torch.einsum('d, n b t d -> n b t', self.pseudo_query, K)
-        # Mask out invalid (future) sources with -inf
-        logits = logits + (~mask)[:, None, None].float() * (-1e9)
         weights = F.softmax(logits, dim=0)
         return torch.einsum('n b t, n b t d -> b t d', weights, sources)
 class CastedLinear(nn.Linear):
@@ -806,21 +801,15 @@ class GPT(nn.Module):
         x0 = x
         ve_cache: dict = {}
         if self.attn_res_enabled:
-            num_layers = len(self.blocks)
-            # Pre-allocate source buffer for torch.compile compatibility
-            # sources[0] = embedding, sources[i+1] = output of block i
-            sources = torch.zeros(num_layers + 1, x.size(0), x.size(1), x.size(2), dtype=x.dtype, device=x.device)
-            sources[0] = x  # embedding as source 0
-            # Pre-allocate mask buffer (all False initially, source 0 is valid)
-            mask = torch.zeros(num_layers + 1, dtype=torch.bool, device=x.device)
-            mask[0] = True
-            for i in range(num_layers):
-                # AttnRes: learned weighted combination of valid sources
-                x = self.attn_res_ops[i](sources, mask)
+            # Use Python list + torch.stack (no in-place mutation for autograd)
+            src_list: list[Tensor] = [x]  # source 0 = embedding
+            for i in range(len(self.blocks)):
+                # AttnRes: learned weighted combination of all sources so far
+                stacked = torch.stack(src_list, dim=0)  # (i+1, B, T, d)
+                x = self.attn_res_ops[i](stacked)
                 ve = self._get_ve(i, input_ids, ve_cache)
                 x = self.blocks[i](x, x0, v_embed=ve)
-                sources[i + 1] = x  # store block output as next source
-                mask[i + 1] = True
+                src_list.append(x)
         else:
             skips: list[Tensor] = []
             for i in range(self.num_encoder_layers):
@@ -871,17 +860,13 @@ class GPT(nn.Module):
         x0 = x
         ve_cache: dict = {}
         if self.attn_res_enabled:
-            num_layers = len(self.blocks)
-            sources = torch.zeros(num_layers + 1, x.size(0), x.size(1), x.size(2), dtype=x.dtype, device=x.device)
-            sources[0] = x
-            mask = torch.zeros(num_layers + 1, dtype=torch.bool, device=x.device)
-            mask[0] = True
-            for i in range(num_layers):
-                x = self.attn_res_ops[i](sources, mask)
+            src_list: list[Tensor] = [x]
+            for i in range(len(self.blocks)):
+                stacked = torch.stack(src_list, dim=0)
+                x = self.attn_res_ops[i](stacked)
                 ve = self._get_ve(i, input_ids, ve_cache)
                 x = self.blocks[i](x, x0, v_embed=ve)
-                sources[i + 1] = x
-                mask[i + 1] = True
+                src_list.append(x)
         else:
             skips: list[Tensor] = []
             for i in range(self.num_encoder_layers):
