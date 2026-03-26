@@ -744,7 +744,9 @@ class GPT(nn.Module):
         # Progressive Looping: repeat middle encoder layers for effective depth increase
         # num_encoder_layers = 11//2 = 5 (indices 0-4), avoid last encoder (4) to preserve skip boundary
         self._loop_layers = {2, 3}  # middle encoder layers to repeat
-        self._loop_active = False   # activated during late training
+        # Use a learnable gate (init=0) instead of boolean flag to avoid torch.compile recompilation
+        # Gate starts at 0 (no effect), training loop sets it to 1.0 when lr_scale < 0.2
+        self._loop_gate = nn.Buffer(torch.tensor(0.0))
         self._init_weights()
     def _init_weights(self) -> None:
         if self.tie_embeddings:
@@ -777,12 +779,14 @@ class GPT(nn.Module):
         x0 = x
         skips: list[Tensor] = []
         ve_cache: dict = {}
+        gate = self._loop_gate.to(dtype=x.dtype)
         for i in range(self.num_encoder_layers):
             ve = self._get_ve(i, input_ids, ve_cache)
             x = self.blocks[i](x, x0, v_embed=ve)
-            # Progressive Looping: repeat this layer if active
-            if self._loop_active and i in self._loop_layers:
-                x = self.blocks[i](x, x0, v_embed=ve)
+            # Progressive Looping: always run 2nd pass, gated by _loop_gate (0→no effect, 1→full repeat)
+            if i in self._loop_layers:
+                x_loop = self.blocks[i](x, x0, v_embed=ve)
+                x = x + gate * (x_loop - x)  # gate=0: x unchanged, gate=1: x=x_loop
             skips.append(x)
         for i in range(self.num_decoder_layers):
             bi = self.num_encoder_layers + i
@@ -828,12 +832,13 @@ class GPT(nn.Module):
         x0 = x
         skips: list[Tensor] = []
         ve_cache: dict = {}
+        gate = self._loop_gate.to(dtype=x.dtype)
         for i in range(self.num_encoder_layers):
             ve = self._get_ve(i, input_ids, ve_cache)
             x = self.blocks[i](x, x0, v_embed=ve)
-            # Progressive Looping: repeat this layer if active
-            if self._loop_active and i in self._loop_layers:
-                x = self.blocks[i](x, x0, v_embed=ve)
+            if i in self._loop_layers:
+                x_loop = self.blocks[i](x, x0, v_embed=ve)
+                x = x + gate * (x_loop - x)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             bi = self.num_encoder_layers + i
@@ -1285,8 +1290,8 @@ def main() -> None:
             CastedLinear._qat_enabled = True
             log0(f"late_qat:enabled step:{step} scale:{scale:.4f}")
         # Progressive Looping: activate when lr_scale < 0.2
-        if scale < 0.2 and not base_model._loop_active:
-            base_model._loop_active = True
+        if scale < 0.2 and base_model._loop_gate.item() < 0.5:
+            base_model._loop_gate.fill_(1.0)
             log0(f"progressive_loop:enabled step:{step} scale:{scale:.4f} layers:{base_model._loop_layers}")
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
@@ -1416,7 +1421,7 @@ def main() -> None:
     restore_low_dim_params_to_fp32(eval_model)
     eval_model.load_state_dict(deq_state, strict=True)
     # Progressive Looping: enable looping in eval model to match training
-    eval_model._loop_active = True
+    eval_model._loop_gate.fill_(1.0)
     compiled_eval = torch.compile(eval_model, dynamic=False, fullgraph=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
