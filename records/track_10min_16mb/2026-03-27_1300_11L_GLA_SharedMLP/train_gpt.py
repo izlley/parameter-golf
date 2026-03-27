@@ -686,9 +686,10 @@ class GLALayer(nn.Module):
         q = self.q_proj(u).reshape(B, -1, self.num_heads, self.head_dim)
         k = self.k_proj(u).reshape(B, -1, self.num_heads, self.head_dim)
         v = self.v_proj(u).reshape(B, -1, self.num_heads, self.head_dim)
-        # Normalize Q, K for stability + scale by 1/sqrt(d) to keep qk products bounded
+        # Normalize Q, K, V for stability + scale by 1/sqrt(d) to keep qk products bounded
         q = F.rms_norm(q, (q.size(-1),)) * (self.head_dim ** -0.5)
         k = F.rms_norm(k, (k.size(-1),))
+        v = F.rms_norm(v, (v.size(-1),))
         # Gate: log-sigmoid for numerical stability in cumsum
         # Clamp input to prevent saturation, and clamp output to ensure minimum decay
         # (like SSD's A = -exp(A_log) which is always negative)
@@ -1074,8 +1075,12 @@ def quantize_int6_per_row(t: Tensor, clip_range: int = 31) -> tuple[Tensor, Tens
             q = torch.clamp(torch.round(t32 / s.float()[:, None]), -clip_range, clip_range).to(torch.int8)
             recon = q.float() * s.float()[:, None]
             err = (t32 - recon).pow(2).mean().item()
-            if err < best_err:
+            if not math.isnan(err) and err < best_err:
                 best_q, best_s, best_err = q, s, err
+        if best_q is None:
+            s = torch.ones(t32.shape[0], dtype=torch.float16)
+            best_q = torch.clamp(torch.round(t32.nan_to_num(0.0)), -clip_range, clip_range).to(torch.int8)
+            best_s = s
         return best_q, best_s
     amax = t32.abs().max().item()
     scale = torch.tensor(amax / clip_range if amax > 0 else 1.0, dtype=torch.float16)
