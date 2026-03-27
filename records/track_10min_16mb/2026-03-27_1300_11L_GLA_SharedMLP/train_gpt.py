@@ -620,44 +620,41 @@ def _gla_chunk_fwd(q: Tensor, k: Tensor, v: Tensor, g: Tensor, chunk_size: int) 
     """Chunk-wise GLA forward. All inputs: (B, L, H, D).
     g: (B, L, H) — log-space gates (after log_sigmoid).
     Returns y: (B, L, H, D)."""
+    orig_dtype = q.dtype
     b, l, h, d = q.shape
     cs = chunk_size
     c_num = l // cs
-    q = q.reshape(b, c_num, cs, h, d)
-    k = k.reshape(b, c_num, cs, h, d)
-    v = v.reshape(b, c_num, cs, h, d)
-    g = g.reshape(b, c_num, cs, h)
+    # Upcast to float32 for numerical stability (cumsum, exp, einsum overflow in bf16)
+    q = q.float().reshape(b, c_num, cs, h, d)
+    k = k.float().reshape(b, c_num, cs, h, d)
+    v = v.float().reshape(b, c_num, cs, h, d)
+    g = g.float().reshape(b, c_num, cs, h)
+    # Clamp gate to prevent extreme cumulative sums
+    g = g.clamp(min=-8.0)  # log_sigmoid range is (-inf, 0); clamp avoids -inf accumulation
     # Cumulative gate within each chunk: G_cumsum[t] = sum(g[0..t])
     g_cumsum = torch.cumsum(g, dim=2)  # (B, C, cs, H)
     # 1. Intra-chunk: causal attention with relative gating
-    # Attention weights: A[i,j] = exp(g_cumsum[i] - g_cumsum[j]) * (q[i] @ k[j]^T)
-    # For i >= j (causal)
     qk = torch.einsum("bclhd, bcshd -> bchls", q, k)  # (B, C, H, cs, cs)
     g_diff = g_cumsum.permute(0, 1, 3, 2).unsqueeze(-1) - g_cumsum.permute(0, 1, 3, 2).unsqueeze(-2)  # (B, C, H, cs, cs)
     causal_mask = torch.tril(torch.ones(cs, cs, dtype=torch.bool, device=q.device))
     attn = (qk * torch.exp(g_diff)).masked_fill(~causal_mask, 0)
     Y_diag = torch.einsum("bchls, bcshd -> bclhd", attn, v)
     # 2. Inter-chunk: recurrent state passing
-    # Per-chunk state: S_c = sum_t exp(G_end - G_t) * k_t^T @ v_t
     decay = torch.exp(g_cumsum[:, :, -1:, :] - g_cumsum)  # (B, C, cs, H)
-    # S_c = einsum("bcth, bcthd, bcthe -> bchde", decay, k, v) — but d,e are same dim
     states = torch.einsum("bcth, bcthd, bcthe -> bchde", decay, k, v)  # (B, C, H, D, D)
-    # Recurrence: accumulate states across chunks with inter-chunk decay
     chunk_decay = torch.exp(g_cumsum[:, :, -1, :])  # (B, C, H) — total decay per chunk
     # Sequential scan over chunks
     outputs: list[Tensor] = []
-    h_state = torch.zeros(b, h, d, d, device=q.device, dtype=q.dtype)
+    h_state = torch.zeros(b, h, d, d, device=q.device, dtype=torch.float32)
     for c in range(c_num):
-        # State-to-output for this chunk
         intra_decay = torch.exp(g_cumsum[:, c, :, :])  # (B, cs, H)
         Y_off_c = torch.einsum("bth, bthd, bhde -> bthe", intra_decay, q[:, c], h_state)  # (B, cs, H, D)
         outputs.append(Y_off_c)
-        # Update hidden state: h = decay * h + S_c
         cd = chunk_decay[:, c, :]  # (B, H)
         h_state = cd[:, :, None, None] * h_state + states[:, c]
     Y_off = torch.stack(outputs, dim=1)  # (B, C, cs, H, D)
     Y = (Y_diag + Y_off).reshape(b, l, h, d)
-    return Y
+    return Y.to(orig_dtype)
 class GLALayer(nn.Module):
     """Pure PyTorch Gated Linear Attention layer."""
     def __init__(self, d_model: int, num_heads: int = 16, chunk_size: int = 128):
@@ -688,8 +685,8 @@ class GLALayer(nn.Module):
         q = self.q_proj(u).reshape(B, -1, self.num_heads, self.head_dim)
         k = self.k_proj(u).reshape(B, -1, self.num_heads, self.head_dim)
         v = self.v_proj(u).reshape(B, -1, self.num_heads, self.head_dim)
-        # Normalize Q, K for stability
-        q = F.rms_norm(q, (q.size(-1),))
+        # Normalize Q, K for stability + scale by 1/sqrt(d) to keep qk products bounded
+        q = F.rms_norm(q, (q.size(-1),)) * (self.head_dim ** -0.5)
         k = F.rms_norm(k, (k.size(-1),))
         # Gate: log-sigmoid for numerical stability in cumsum
         g = F.logsigmoid(self.gate_proj(u))  # (B, L, H)
@@ -1124,7 +1121,12 @@ def dequantize_mixed_int6(result: dict[str, Tensor], meta: dict[str, object],
                 t = t.to(orig_dtype)
             out[name] = t
             continue
-        q, s = result[name + ".q"], result[name + ".scale"]
+        q_key, s_key = name + ".q", name + ".scale"
+        if q_key not in result or s_key not in result:
+            continue  # skip keys missing from quantized result
+        q, s = result[q_key], result[s_key]
+        if s is None or q is None:
+            continue
         if s.ndim > 0:
             out[name] = (q.float() * s.float().view(q.shape[0], *([1] * (q.ndim - 1)))).to(orig_dtype)
         else:
