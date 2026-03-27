@@ -629,25 +629,26 @@ def _gla_chunk_fwd(q: Tensor, k: Tensor, v: Tensor, g: Tensor, chunk_size: int) 
     k = k.float().reshape(b, c_num, cs, h, d)
     v = v.float().reshape(b, c_num, cs, h, d)
     g = g.float().reshape(b, c_num, cs, h)
-    # Clamp gate to prevent extreme cumulative sums
-    g = g.clamp(min=-8.0)  # log_sigmoid range is (-inf, 0); clamp avoids -inf accumulation
+    # g is already clamped to [-6, 6] input + max=-0.01 output in GLALayer.forward
     # Cumulative gate within each chunk: G_cumsum[t] = sum(g[0..t])
     g_cumsum = torch.cumsum(g, dim=2)  # (B, C, cs, H)
     # 1. Intra-chunk: causal attention with relative gating
     qk = torch.einsum("bclhd, bcshd -> bchls", q, k)  # (B, C, H, cs, cs)
     g_diff = g_cumsum.permute(0, 1, 3, 2).unsqueeze(-1) - g_cumsum.permute(0, 1, 3, 2).unsqueeze(-2)  # (B, C, H, cs, cs)
     causal_mask = torch.tril(torch.ones(cs, cs, dtype=torch.bool, device=q.device))
-    attn = (qk * torch.exp(g_diff)).masked_fill(~causal_mask, 0)
+    # Clamp g_diff to prevent exp overflow (causal part should be <=0, but clamp for safety)
+    attn = (qk * torch.exp(g_diff.clamp(max=0.0))).masked_fill(~causal_mask, 0)
     Y_diag = torch.einsum("bchls, bcshd -> bclhd", attn, v)
     # 2. Inter-chunk: recurrent state passing
-    decay = torch.exp(g_cumsum[:, :, -1:, :] - g_cumsum)  # (B, C, cs, H)
+    decay = torch.exp((g_cumsum[:, :, -1:, :] - g_cumsum).clamp(max=0.0))  # (B, C, cs, H)
     states = torch.einsum("bcth, bcthd, bcthe -> bchde", decay, k, v)  # (B, C, H, D, D)
-    chunk_decay = torch.exp(g_cumsum[:, :, -1, :])  # (B, C, H) — total decay per chunk
+    # chunk_decay: total decay per chunk, clamped to (0, 1) to guarantee state shrinkage
+    chunk_decay = torch.exp(g_cumsum[:, :, -1, :]).clamp(max=0.999)  # (B, C, H)
     # Sequential scan over chunks
     outputs: list[Tensor] = []
     h_state = torch.zeros(b, h, d, d, device=q.device, dtype=torch.float32)
     for c in range(c_num):
-        intra_decay = torch.exp(g_cumsum[:, c, :, :])  # (B, cs, H)
+        intra_decay = torch.exp(g_cumsum[:, c, :, :].clamp(max=0.0))  # (B, cs, H)
         Y_off_c = torch.einsum("bth, bthd, bhde -> bthe", intra_decay, q[:, c], h_state)  # (B, cs, H, D)
         outputs.append(Y_off_c)
         cd = chunk_decay[:, c, :]  # (B, H)
@@ -689,7 +690,10 @@ class GLALayer(nn.Module):
         q = F.rms_norm(q, (q.size(-1),)) * (self.head_dim ** -0.5)
         k = F.rms_norm(k, (k.size(-1),))
         # Gate: log-sigmoid for numerical stability in cumsum
-        g = F.logsigmoid(self.gate_proj(u))  # (B, L, H)
+        # Clamp input to prevent saturation, and clamp output to ensure minimum decay
+        # (like SSD's A = -exp(A_log) which is always negative)
+        g = F.logsigmoid(self.gate_proj(u).clamp(-6, 6))  # (B, L, H)
+        g = g.clamp(max=-0.01)  # minimum 1% decay per step — prevents unbounded h_state growth
         y = _gla_chunk_fwd(q, k, v, g, cs)
         y = y.reshape(B, -1, D)
         y = self.norm(y)
