@@ -1245,7 +1245,8 @@ def e2e_ttt_rehearsal(
             return fwd
         block.mlp.forward = _make_fwd(fc, proj, ms)
 
-    # Inner loop: learn masks (differentiable w.r.t. model weights)
+    # Inner loop: learn masks using FOMAML (first-order meta-learning)
+    # No create_graph=True to avoid OOM from storing full computation graph
     for _inner in range(inner_steps):
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             inner_logits = raw_model.forward_logits(x)
@@ -1253,12 +1254,12 @@ def e2e_ttt_rehearsal(
             inner_logits.reshape(-1, inner_logits.size(-1)).float(),
             y.reshape(-1),
         )
-        # Compute gradients for masks only, keep graph for model weight grads
-        mask_grads = torch.autograd.grad(inner_loss, temp_masks, create_graph=True)
-        # Update masks with gradient descent (differentiable)
+        # First-order gradients only (no graph retained)
+        mask_grads = torch.autograd.grad(inner_loss, temp_masks, create_graph=False)
+        # Update masks with gradient descent
         new_masks: list[Tensor] = []
         for ms, g in zip(temp_masks, mask_grads):
-            new_masks.append(ms - inner_lr * g)
+            new_masks.append((ms - inner_lr * g).detach().requires_grad_(True))
         temp_masks = new_masks
 
         # Re-patch with updated masks
