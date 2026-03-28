@@ -965,11 +965,11 @@ def eval_val_sliding_ttt(
         attn_bias = torch.zeros(attn_dim, device=device, requires_grad=True)
         # LoRA rank-1 for MLP proj: output correction
         # MLP proj: hidden_dim → model_dim, so LoRA: hidden_dim → 1 → model_dim
-        mlp_lora_A = torch.randn(hidden_dim, 1, device=device, requires_grad=True) * 0.01
-        mlp_lora_B = torch.randn(1, attn_dim, device=device, requires_grad=True) * 0.01  # attn_dim = model_dim
+        mlp_lora_A = (torch.randn(hidden_dim, 1, device=device) * 0.01).requires_grad_(True)
+        mlp_lora_B = (torch.randn(1, attn_dim, device=device) * 0.01).requires_grad_(True)  # attn_dim = model_dim
         # LoRA rank-1 for Attn proj: output correction
-        attn_lora_A = torch.randn(attn_dim, 1, device=device, requires_grad=True) * 0.01
-        attn_lora_B = torch.randn(1, attn_dim, device=device, requires_grad=True) * 0.01
+        attn_lora_A = (torch.randn(attn_dim, 1, device=device) * 0.01).requires_grad_(True)
+        attn_lora_B = (torch.randn(1, attn_dim, device=device) * 0.01).requires_grad_(True)
         mask_scores.extend([mlp_ms, mlp_bias, attn_ms, attn_bias,
                            mlp_lora_A, mlp_lora_B, attn_lora_A, attn_lora_B])
         original_mlp_forwards.append(block.mlp.forward)
