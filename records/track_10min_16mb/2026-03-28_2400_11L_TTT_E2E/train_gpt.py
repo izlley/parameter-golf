@@ -19,6 +19,8 @@ except ImportError:
 import numpy as np
 import sentencepiece as spm
 import torch
+import torch._dynamo
+torch._dynamo.config.recompile_limit = 64  # e2e_ttt_rehearsal monkey-patches forwards
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
