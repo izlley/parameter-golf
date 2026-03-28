@@ -863,8 +863,12 @@ def eval_val_sliding(
     stride: int,
     batch_seqs: int = 32,
     eval_seq_len: int | None = None,
+    ngram_alpha: float = 0.0,
+    ngram_max_order: int = 5,
+    ngram_min_count: int = 2,
+    ngram_max_tokens: int = 500_000,
 ) -> tuple[float, float]:
-    """Sliding window evaluation: each token scored with maximum context."""
+    """Sliding window evaluation with optional N-gram backoff blending."""
     seq_len = eval_seq_len or args.train_seq_len
     total_tokens = val_tokens.numel() - 1
     window_starts = [ws for ws in range(0, total_tokens, stride)
@@ -876,6 +880,14 @@ def eval_val_sliding(
     loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     token_count = torch.zeros((), device=device, dtype=torch.float64)
     byte_count = torch.zeros((), device=device, dtype=torch.float64)
+    # N-gram setup
+    use_ngram = ngram_alpha > 0.0
+    ngram_cache = None
+    if use_ngram:
+        ngram_cache = NgramCache(max_order=ngram_max_order, vocab_size=args.vocab_size,
+                                  min_count=ngram_min_count, max_tokens=ngram_max_tokens)
+        log_1ma = math.log(1.0 - ngram_alpha)
+        log_a = math.log(ngram_alpha)
     base_model.eval()
     compiled_logits = torch.compile(base_model.forward_logits, dynamic=False, fullgraph=True)
     with torch.inference_mode():
@@ -894,15 +906,36 @@ def eval_val_sliding(
                 y_batch[i, :wlen] = chunk[1:]
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 logits = compiled_logits(x_batch)
-            nll = F.cross_entropy(
-                logits.reshape(-1, logits.size(-1)).float(),
-                y_batch.reshape(-1),
-                reduction="none",
-            ).reshape(bsz, seq_len)
+            if not use_ngram:
+                nll = F.cross_entropy(
+                    logits.reshape(-1, logits.size(-1)).float(),
+                    y_batch.reshape(-1), reduction="none",
+                ).reshape(bsz, seq_len)
+            logits_f = logits.float() if use_ngram else None
             for i, ws in enumerate(batch_ws):
                 wlen = wlens[i]
                 s = 0 if ws == 0 else max(wlen - stride, 0)
-                scored_nll = nll[i, s:wlen].to(torch.float64)
+                if use_ngram and ngram_cache.unigram_total >= ngram_cache.min_count:
+                    model_lp = F.log_softmax(logits_f[i, s:wlen], dim=-1)
+                    scored_targets = y_batch[i, s:wlen]
+                    ngram_lp = ngram_cache.get_log_probs_batch(x_batch[i], s, wlen, device)
+                    if ngram_lp is not None:
+                        blended_lp = torch.logaddexp(model_lp + log_1ma, ngram_lp + log_a)
+                        scored_nll = -blended_lp[
+                            torch.arange(scored_targets.size(0), device=device), scored_targets,
+                        ].to(torch.float64)
+                    else:
+                        scored_nll = -model_lp[
+                            torch.arange(scored_targets.size(0), device=device), scored_targets,
+                        ].to(torch.float64)
+                elif use_ngram:
+                    model_lp = F.log_softmax(logits_f[i, s:wlen], dim=-1)
+                    scored_targets = y_batch[i, s:wlen]
+                    scored_nll = -model_lp[
+                        torch.arange(scored_targets.size(0), device=device), scored_targets,
+                    ].to(torch.float64)
+                else:
+                    scored_nll = nll[i, s:wlen].to(torch.float64)
                 loss_sum += scored_nll.sum()
                 token_count += float(wlen - s)
                 tgt = y_batch[i, s:wlen]
@@ -910,6 +943,11 @@ def eval_val_sliding(
                 tb = base_bytes_lut[tgt].to(torch.float64)
                 tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
                 byte_count += tb.sum()
+                # Update ngram cache with scored tokens (legal: already scored)
+                if use_ngram:
+                    ctx_start = max(0, ws - ngram_max_order)
+                    end_pos = min(ws + wlen + 1, val_tokens.numel())
+                    ngram_cache.update_batch(val_tokens[ctx_start:end_pos].tolist())
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
         dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
@@ -955,25 +993,41 @@ class MuonLiteTTT(torch.optim.Optimizer):
 class NgramCache:
     """Lightweight N-gram language model for backoff blending at eval time.
     Accumulates counts from already-scored tokens (legal: only past data).
-    Returns log-probability tensor on GPU for blending with model logits."""
+    Uses numpy arrays for fast vectorized operations.
+    Supports max_tokens limit (LRU-style: keeps only recent tokens)."""
 
-    def __init__(self, max_order: int = 5, vocab_size: int = 1024, min_count: int = 2):
+    def __init__(self, max_order: int = 5, vocab_size: int = 1024, min_count: int = 2,
+                 max_tokens: int = 500_000):
+        import numpy as np
+        self.np = np
         self.max_order = max_order
         self.vocab_size = vocab_size
         self.min_count = min_count
-        # counts[order] maps context_tuple -> int-array of counts (on CPU as numpy for speed)
-        self.counts: list[dict[tuple, list[int]]] = [dict() for _ in range(max_order)]
-        # unigram counts (order 0 - no context)
-        self.unigram = [0] * vocab_size
+        self.max_tokens = max_tokens  # Fix 3: LRU cache size limit
+        # counts[order] maps context_tuple -> numpy array of counts
+        self.counts: list[dict[tuple, any]] = [dict() for _ in range(max_order)]
+        # unigram counts as numpy array
+        self.unigram = np.zeros(vocab_size, dtype=np.int32)
         self.unigram_total = 0
+        # Token history for LRU eviction
+        self._token_history: list[int] = []
 
     def update_batch(self, token_ids: list[int]) -> None:
-        """Update counts with a batch of observed tokens."""
+        """Update counts with a batch of observed tokens. Uses numpy for speed."""
+        np = self.np
         V = self.vocab_size
-        uni = self.unigram
-        for t in token_ids:
-            uni[t] += 1
+        # Fix 3: LRU — if adding these tokens exceeds limit, rebuild from recent tokens
+        self._token_history.extend(token_ids)
+        if len(self._token_history) > self.max_tokens:
+            # Keep only the most recent max_tokens
+            self._token_history = self._token_history[-self.max_tokens:]
+            self._rebuild_counts()
+            return
+        # Fix 1: numpy-based unigram update (vectorized)
+        ids_arr = np.array(token_ids, dtype=np.int32)
+        np.add.at(self.unigram, ids_arr, 1)
         self.unigram_total += len(token_ids)
+        # Fix 1: n-gram count update — still uses dict but with numpy arrays
         counts = self.counts
         max_order = self.max_order
         n = len(token_ids)
@@ -985,73 +1039,70 @@ class NgramCache:
                 if ctx in cdict:
                     cdict[ctx][tgt] += 1
                 else:
-                    arr = [0] * V
+                    arr = np.zeros(V, dtype=np.int32)
                     arr[tgt] = 1
                     cdict[ctx] = arr
 
-    def get_log_probs(self, context_ids: list[int], device: torch.device) -> torch.Tensor | None:
-        """Get backoff N-gram log-probability distribution for the next token.
-        Uses highest-order matching context with sufficient counts, backs off to lower orders.
-        Returns log-prob tensor of shape (vocab_size,) or None if no data."""
-        max_ctx = min(self.max_order, len(context_ids))
-        for order in range(max_ctx, 0, -1):
-            ctx = tuple(context_ids[-order:])
+    def _rebuild_counts(self) -> None:
+        """Rebuild all counts from _token_history (used after LRU eviction)."""
+        np = self.np
+        V = self.vocab_size
+        self.unigram = np.zeros(V, dtype=np.int32)
+        self.unigram_total = 0
+        for d in self.counts:
+            d.clear()
+        tokens = self._token_history
+        n = len(tokens)
+        ids_arr = np.array(tokens, dtype=np.int32)
+        np.add.at(self.unigram, ids_arr, 1)
+        self.unigram_total = n
+        for order in range(1, self.max_order + 1):
             cdict = self.counts[order - 1]
-            if ctx in cdict:
-                arr = cdict[ctx]
-                total = sum(arr)
-                if total >= self.min_count:
-                    # Add-1 (Laplace) smoothing
-                    t = torch.tensor(arr, dtype=torch.float32, device=device)
-                    t = (t + 1.0) / (total + self.vocab_size)
-                    return t.log()
-        # Fallback to unigram
-        if self.unigram_total >= self.min_count:
-            t = torch.tensor(self.unigram, dtype=torch.float32, device=device)
-            t = (t + 1.0) / (self.unigram_total + self.vocab_size)
-            return t.log()
-        return None
-
-    def _get_unigram_log_probs(self, device: torch.device) -> torch.Tensor:
-        """Cached unigram log-probs."""
-        t = torch.tensor(self.unigram, dtype=torch.float32, device=device)
-        t = (t + 1.0) / (self.unigram_total + self.vocab_size)
-        return t.log()
+            for i in range(n - order):
+                ctx = tuple(tokens[i:i + order])
+                tgt = tokens[i + order]
+                if ctx in cdict:
+                    cdict[ctx][tgt] += 1
+                else:
+                    arr = np.zeros(V, dtype=np.int32)
+                    arr[tgt] = 1
+                    cdict[ctx] = arr
 
     def get_log_probs_batch(self, x_seq: torch.Tensor, start_pos: int, end_pos: int,
                             device: torch.device) -> torch.Tensor | None:
-        """Get N-gram log-probs for positions [start_pos, end_pos) in a sequence.
-        x_seq: 1D tensor of input token ids for one sequence.
-        Returns tensor of shape (end_pos - start_pos, vocab_size) or None."""
+        """Get N-gram log-probs for positions [start_pos, end_pos). Vectorized with numpy."""
+        np = self.np
         n_pos = end_pos - start_pos
         if self.unigram_total < self.min_count:
             return None
-        # Pre-compute unigram fallback once
-        uni_lp = self._get_unigram_log_probs(device)
-        result = uni_lp.unsqueeze(0).expand(n_pos, -1).clone()
+        V = self.vocab_size
+        # Fix 1: Pre-compute unigram log-probs as numpy, convert once to GPU
+        uni_lp_np = np.log((self.unigram.astype(np.float32) + 1.0) / (self.unigram_total + V))
+        # Build result as numpy array (CPU), then transfer once to GPU
+        result_np = np.tile(uni_lp_np, (n_pos, 1))  # (n_pos, V)
         x_list = x_seq.tolist()
         for idx in range(n_pos):
             pos = start_pos + idx
-            # context is all tokens up to and including position pos
             ctx_ids = x_list[max(0, pos - self.max_order + 1):pos + 1]
-            # Try higher-order n-grams (skip unigram fallback since already set)
             max_ctx = min(self.max_order, len(ctx_ids))
             for order in range(max_ctx, 0, -1):
                 ctx = tuple(ctx_ids[-order:])
                 cdict = self.counts[order - 1]
                 if ctx in cdict:
                     arr = cdict[ctx]
-                    total = sum(arr)
+                    total = arr.sum()
                     if total >= self.min_count:
-                        t = torch.tensor(arr, dtype=torch.float32, device=device)
-                        t = (t + 1.0) / (total + self.vocab_size)
-                        result[idx] = t.log()
+                        # Fix 1: numpy log directly, no torch.tensor per position
+                        result_np[idx] = np.log((arr.astype(np.float32) + 1.0) / (total + V))
                         break
-        return result
+        return torch.from_numpy(result_np).to(device=device)
 
     def reset(self) -> None:
         for d in self.counts:
             d.clear()
+        self.unigram[:] = 0
+        self.unigram_total = 0
+        self._token_history.clear()
         self.unigram = [0] * self.vocab_size
         self.unigram_total = 0
 
@@ -1153,16 +1204,8 @@ def eval_val_sliding_ttt(
     optimizer = MuonLiteTTT(mask_scores, lr=args.ttt_lr, momentum=args.ttt_momentum)
     t0 = time.perf_counter()
 
-    # N-gram backoff cache: accumulates counts from already-scored tokens
-    ngram_cache = NgramCache(
-        max_order=args.ngram_max_order,
-        vocab_size=args.vocab_size,
-        min_count=args.ngram_min_count,
-    )
-    ngram_alpha = args.ngram_blend_alpha
-    use_ngram = ngram_alpha > 0.0
-    # Buffer to collect scored tokens for this chunk (to update ngram after scoring)
-    chunk_scored_tokens: list[int] = []
+    # Fix 2: N-gram blending disabled in TTT eval (too slow with Python loops).
+    # N-gram is applied only in the final sliding_window eval after TTT.
 
     for ci in range(num_chunks):
         windows = chunk_windows[ci]
@@ -1176,7 +1219,6 @@ def eval_val_sliding_ttt(
         my_e = (len(windows) * (rank + 1)) // world_size
         my_windows = windows[my_s:my_e]
 
-        chunk_scored_tokens.clear()
         base_model.eval()
         with torch.inference_mode():
             for bi in range(0, len(my_windows), batch_seqs):
@@ -1194,59 +1236,20 @@ def eval_val_sliding_ttt(
                     y_batch[i, :wlen] = chunk_tok[1:]
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     logits = base_model.forward_logits(x_batch)
-                # Convert to float32 log-probs for blending
-                logits_f = logits.float()
+                nll = F.cross_entropy(
+                    logits.reshape(-1, logits.size(-1)).float(),
+                    y_batch.reshape(-1), reduction="none",
+                ).reshape(bsz, seq_len)
                 for i, ws in enumerate(batch_ws):
                     wlen = wlens[i]
                     s = 0 if ws == 0 else max(wlen - stride, 0)
-                    # Model log-probs for scored positions
-                    model_lp = F.log_softmax(logits_f[i, s:wlen], dim=-1)  # (scored_len, V)
-                    scored_targets = y_batch[i, s:wlen]  # (scored_len,)
-                    # N-gram blending
-                    if use_ngram and ngram_cache.unigram_total >= ngram_cache.min_count:
-                        ngram_lp = ngram_cache.get_log_probs_batch(
-                            x_batch[i], s, wlen, device
-                        )
-                        if ngram_lp is not None:
-                            # Log-domain mixture: log((1-a)*p_model + a*p_ngram)
-                            # = log(exp(log(1-a)+log_p_model) + exp(log(a)+log_p_ngram))
-                            log_1ma = math.log(1.0 - ngram_alpha)
-                            log_a = math.log(ngram_alpha)
-                            blended_lp = torch.logaddexp(
-                                model_lp + log_1ma,
-                                ngram_lp + log_a,
-                            )
-                            scored_nll = -blended_lp[
-                                torch.arange(scored_targets.size(0), device=device),
-                                scored_targets,
-                            ].to(torch.float64)
-                        else:
-                            scored_nll = -model_lp[
-                                torch.arange(scored_targets.size(0), device=device),
-                                scored_targets,
-                            ].to(torch.float64)
-                    else:
-                        scored_nll = -model_lp[
-                            torch.arange(scored_targets.size(0), device=device),
-                            scored_targets,
-                        ].to(torch.float64)
+                    scored_nll = nll[i, s:wlen].to(torch.float64)
                     loss_sum += scored_nll.sum()
                     token_count += float(wlen - s)
                     tgt, prev = y_batch[i, s:wlen], x_batch[i, s:wlen]
                     tb = base_bytes_lut[tgt].to(torch.float64)
                     tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
                     byte_count += tb.sum()
-                    # Collect scored tokens for ngram update (include context + targets)
-                    if use_ngram:
-                        # Use the full window tokens for richer context
-                        chunk_scored_tokens.extend(y_batch[i, s:wlen].tolist())
-
-        # Update N-gram cache with tokens scored in this chunk (legal: already scored)
-        if use_ngram and chunk_scored_tokens:
-            # Include preceding context for better n-gram coverage
-            ctx_start = max(0, chunk_start - args.ngram_max_order)
-            chunk_context = val_tokens[ctx_start:chunk_end + 1].tolist()
-            ngram_cache.update_batch(chunk_context)
 
         # --- Phase 2: TRAIN masks on this chunk (already scored = legal) ---
         is_last_chunk = (ci == num_chunks - 1)
@@ -1835,6 +1838,9 @@ def main() -> None:
             val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
             stride=args.eval_stride,
             eval_seq_len=sw_seq_len,
+            ngram_alpha=args.ngram_blend_alpha,
+            ngram_max_order=args.ngram_max_order,
+            ngram_min_count=args.ngram_min_count,
         )
         torch.cuda.synchronize()
         log0(
@@ -1853,6 +1859,9 @@ def main() -> None:
             val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
             stride=64,
             eval_seq_len=sw_seq_len,
+            ngram_alpha=args.ngram_blend_alpha,
+            ngram_max_order=args.ngram_max_order,
+            ngram_min_count=args.ngram_min_count,
         )
         torch.cuda.synchronize()
         log0(
