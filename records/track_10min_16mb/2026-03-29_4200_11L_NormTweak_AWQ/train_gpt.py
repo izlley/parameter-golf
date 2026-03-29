@@ -1275,7 +1275,7 @@ def awq_scale_weights(model: nn.Module, state_dict: dict[str, Tensor],
 
     # Run calibration forward passes
     cal_len = min(cal_tokens.numel(), 8192)
-    cal_x = cal_tokens[:cal_len].unsqueeze(0).to(device)
+    cal_x = cal_tokens[:cal_len].long().unsqueeze(0).to(device)
     # Split into chunks to avoid OOM
     chunk_size = 2048
     n_chunks = 0
@@ -1543,7 +1543,7 @@ def norm_tweak(
 
     # Prepare calibration data
     cal_len = min(val_tokens.numel(), 8192)
-    cal_ids = val_tokens[:cal_len].to(device)
+    cal_ids = val_tokens[:cal_len].long().to(device)
     # Build chunks
     cal_chunks_x = []
     cal_chunks_y = []
