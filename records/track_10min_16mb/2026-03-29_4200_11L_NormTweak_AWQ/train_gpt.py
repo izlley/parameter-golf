@@ -1284,7 +1284,8 @@ def awq_scale_weights(model: nn.Module, state_dict: dict[str, Tensor],
         x_chunk = cal_x[:, start:end]
         if x_chunk.shape[1] < 2:
             continue
-        tmp_model.forward_logits(x_chunk)
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            tmp_model.forward_logits(x_chunk)
         n_chunks += 1
 
     for h in hooks:
@@ -1563,9 +1564,10 @@ def norm_tweak(
         chunk_idx = step_i % len(cal_chunks_x)
         x_chunk = cal_chunks_x[chunk_idx]
         optimizer_nt.zero_grad(set_to_none=True)
-        with torch.no_grad():
+        with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             ref_logits = ref_model.forward_logits(x_chunk)
-        quant_logits = quant_model.forward_logits(x_chunk)
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            quant_logits = quant_model.forward_logits(x_chunk)
         # KL divergence: teacher=ref, student=quant
         ref_probs = F.softmax(ref_logits.float(), dim=-1)
         quant_log_probs = F.log_softmax(quant_logits.float(), dim=-1)
