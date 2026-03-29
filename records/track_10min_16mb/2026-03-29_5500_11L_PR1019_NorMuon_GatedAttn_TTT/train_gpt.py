@@ -1760,7 +1760,7 @@ def eval_val_sliding_ttt(
                     end = min(ws + seq_len, chunk_len)
                     wlen = end - ws
                     wlens.append(wlen)
-                    ch = chunk_tokens[chunk_start + ws:chunk_start + end + 1].to(
+                    ch = chunk_tokens[ws:end + 1].to(
                         dtype=torch.int64, device=device)
                     x_batch[i, :wlen] = ch[:-1]
                     y_batch[i, :wlen] = ch[1:]
