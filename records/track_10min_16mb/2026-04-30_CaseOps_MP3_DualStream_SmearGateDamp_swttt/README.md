@@ -251,13 +251,10 @@ torchrun --standalone --nproc_per_node=8 train_gpt.py
 
 | Seed | val_bpb (swttt) | val_loss | size (bytes) | step_avg | steps |
 |---|---|---|---|---|---|
-| 42 | TBD (5-seed run on runpod) | TBD | TBD | TBD | TBD |
-| 0 | TBD | TBD | TBD | TBD | TBD |
+| 42   | TBD | TBD | TBD | TBD | TBD |
+| 0    | TBD | TBD | TBD | TBD | TBD |
 | 1234 | TBD | TBD | TBD | TBD | TBD |
-| 314 | TBD | TBD | TBD | TBD | TBD |
-| 999 | TBD | TBD | TBD | TBD | TBD |
 | **Mean** | **TBD** | **TBD** | **TBD** | **TBD** | **TBD** |
 
-(1-seed reference on author's DGX H100 with same code — seed 42:
-val_bpb=1.06653, size=15,979,621 bytes, steps=4455, step_avg=134.69 ms,
-note runpod SXM tends to give slightly faster steps and tighter `val_bpb`.)
+(1-seed DGX reference with the same code: seed 42 → val_bpb=1.06653,
+size=15,979,621 bytes, steps=4455, step_avg=134.69 ms.)
