@@ -1,10 +1,14 @@
-# Record candidate: 11L XSA + CaseOps + MP3 marker-pair fusion + SmearGate (alias-prev dampening) + LQER + swttt
+# Record candidate: 11L XSA + CaseOps + MP3 marker-pair fusion + DualStream + SmearGate (alias-prev dampening) + swttt
 
 **val_bpb: 1.06653** (1-seed measured on 8×H100 SXM, swttt eval) | ~15,979,621 bytes | 8×H100 SXM, 600 s wallclock | TTT (LoRA swttt)
 
 5-seed verification on runpod (SEEDS=42, 0, 1234, 314, 999) — see `train_seed*.log` after the run.
 
-## Headline change vs. 1.0810 leaderboard
+## Headline change vs. current leaderboard
+
+Current leaderboard: **1.08100 BPB**
+([@bigbag, 2026-04-09 record](../2026-04-09_SP8192_3LayerRecur_ParResid_QK525_LegalTTT/) —
+SP8192 + 3-Layer Recurrence + Parallel Residuals + QK-Gain 5.25 + Legal Score-First TTT).
 
 CaseOps tokenizer (lossless lowercase + 4 reserved markers) + **MP3 marker-pair fusion**:
 the three 2-grams `[▁, TITLE]` / `[▁, ALLCAPS]` / `[▁, CAPNEXT]` are fused into single
