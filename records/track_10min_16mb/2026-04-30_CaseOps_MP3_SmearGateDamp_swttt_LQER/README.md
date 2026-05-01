@@ -229,17 +229,6 @@ torchrun --standalone --nproc_per_node=8 train_gpt.py
 - 8 × H100 80 GB SXM (NVLink), 600 s wallclock budget
 - PyTorch 2.9.1+cu128, CUDA 12.8, FlashAttention 3 (Hopper kernels)
 
-## Notes
-
-- This submission uses **brotli q=11** for compression (no system-level lrzip
-  needed), unlike PR #1797's per-group lrzip pipeline. Compression is monolithic
-  on the int6 GPTQ blob plus int8 embedding plus state-dict scaffolding.
-- The 600 s budget includes GPTQ calibration; `GPTQ_RESERVE_SECONDS` is internally
-  managed by `train_gpt.py`.
-- TTT here is `swttt` (sliding-window TTT), not phased TTT — LoRA adapters are
-  trained on a sliding window over the val docs and applied during the same
-  forward pass at eval time. See `train_gpt.py` for details.
-
 ## Submission status
 
 | Seed | val_bpb (swttt) | val_loss | size (bytes) | step_avg | steps |
