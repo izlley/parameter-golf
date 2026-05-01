@@ -103,6 +103,31 @@ Implemented as a per-position multiplicative mask applied inside the SmearGate p
 `alias_dampening_active` is set (Python-bool flag, set in `main()` to avoid
 torch.compile data-dependent branching).
 
+## Component contributions (1-seed DGX ablations)
+
+Each row reports the swttt `val_bpb` impact of the listed change. Numbers are not
+strictly additive since the stack interactions matter.
+
+| Component | Comparison | Δ val_bpb |
+|---|---|---|
+| **MP3 marker-pair fusion (3 patterns)** | MP3 vs CaseOps base (no fusion)            | **−1.44 mbpb** |
+| ↳ MP1 (TITLE only, single 2-gram)       | MP1 vs CaseOps base                        | −0.32 mbpb     |
+| ↳ +ALLCAPS+CAPNEXT (MP3 over MP1)       | MP3 vs MP1                                 | −1.12 mbpb     |
+| **alias-prev SmearGate dampening 0.5×** | dampening 0.5× vs no dampening (1.0×) on MP3 | **−1.02 mbpb** |
+| **DualStream (early-layer fast/slow)**  | added to an earlier (~1.14 bpb) baseline   | −0.37 mbpb (measured at higher bpb level) |
+| **Static warm-init for alias rows**     | not directly ablated in MP3 setting; in earlier alias-scheme experiments cold-start was unstable for the 4400-step budget | qualitative |
+
+DGX experiments referenced: CaseOps base = 1760 (1.06797), MP1 = 1772 (1.06765),
+MP3 = 1779 (1.06653), no-dampening = 1780 (1.06755), DualStream = exp 441
+(early stack, 1.1385 → 1.1348).
+
+The DualStream contribution is reported on a much higher absolute val_bpb level
+(stack at measurement time was ~1.14, not 1.066). Its absolute effect on the
+current stack is expected to be smaller, but it remains an architecture choice
+in this submission. Static warm-init was kept as a design choice based on
+earlier alias-scheme stability findings; without warm-init the alias rows cold
+start at random and the 4400-step budget is too tight to recover.
+
 ## Why this works (NLL distance breakdown vs. CaseOps base)
 
 Per-position NLL bucketed by distance from the most recent alias position:
