@@ -2082,10 +2082,40 @@ def main() -> None:
    with open(logfile, "a", encoding="utf-8") as f:
     print(msg, file=f)
  log0("=" * 100, console=False)
- log0("Hyperparameters:", console=True)
+ log0("Hyperparameters (Hyperparameters class attrs):", console=True)
  for (_k, _v) in sorted(vars(type(args)).items()):
   if not _k.startswith("_") and not callable(_v):
    log0(f"  {_k}: {_v}", console=True)
+ log0("=" * 100, console=False)
+ log0("Relevant environment variables (os.environ):", console=True)
+ _env_prefixes = (
+  "SEED", "SKIP_TRAINING", "DATA_PATH", "DATA_DIR", "TOKENIZER_PATH", "RUN_ID",
+  "ITERATIONS", "MAX_WALLCLOCK_SECONDS", "WARMUP_STEPS", "WARMDOWN_ITERS", "MIN_LR",
+  "GRAD_CLIP_NORM",
+  "MUON_", "MATRIX_LR", "MATRIX_CLIP_SIGMAS", "EMBED_LR", "EMBED_CLIP_SIGMAS", "ADAM_",
+  "BETA1", "BETA2", "SCALAR_LR", "HEAD_LR", "PARALLEL_LR",
+  "PE_COEFFS",
+  "NUM_LAYERS", "NUM_HEADS", "NUM_KV_HEADS", "MODEL_DIM", "MLP_MULT",
+  "ROPE_BASE", "ROPE_DIMS", "QK_GAIN_INIT", "LOGIT_SOFTCAP",
+  "RECUR_", "PARALLEL_START_LAYER",
+  "ATTN_OUT_GATE", "GATE_WIDTH",
+  "SMEAR_",
+  "TTT_", "EVAL_SEQ_LEN", "EVAL_STRIDE",
+  "LQER_",
+  "GPTQ_",
+  "EMBED_BITS", "TIE_EMBEDDINGS",
+  "CASEOPS_ENABLED", "ALIAS_", "MARKER_", "BOS_ID", "BOOST_MULTIPLIER",
+  "COMPRESSOR",
+ )
+ _env_pairs = []
+ for _ek, _ev in sorted(os.environ.items()):
+  if any(_ek == _p or _ek.startswith(_p) for _p in _env_prefixes):
+   _env_pairs.append((_ek, _ev))
+ if _env_pairs:
+  for _ek, _ev in _env_pairs:
+   log0(f"  {_ek}={_ev}", console=True)
+ else:
+  log0("  (none of the recognised prefixes set in environment)", console=True)
  log0("=" * 100, console=False)
  log0(f"Running Python {sys.version}", console=False)
  log0(f"Running PyTorch {torch.__version__}", console=False)

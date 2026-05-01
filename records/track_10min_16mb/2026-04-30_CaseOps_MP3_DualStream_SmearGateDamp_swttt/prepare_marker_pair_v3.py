@@ -82,6 +82,36 @@ def fuse_stream(toks: np.ndarray, bytes_arr: np.ndarray | None = None):
     return out_toks, out_bytes
 
 
+SHARD_MAGIC = 20240520
+SHARD_VERSION = 1
+HEADER_INTS = 256          # int32 header slots
+HEADER_BYTES = HEADER_INTS * 4
+
+
+def _read_shard_with_header(path: str):
+    """Read a header-prefixed uint16 shard. Returns (header_int32, tokens_uint16)."""
+    header = np.fromfile(path, dtype="<i4", count=HEADER_INTS)
+    if header.size != HEADER_INTS or int(header[0]) != SHARD_MAGIC or int(header[1]) != SHARD_VERSION:
+        raise ValueError(f"unexpected header for {path}")
+    n = int(header[2])
+    toks = np.fromfile(path, dtype="<u2", count=n, offset=HEADER_BYTES)
+    if toks.size != n:
+        raise ValueError(f"short read for {path}: header n={n} got {toks.size}")
+    return header, toks
+
+
+def _write_shard_with_header(path: str, toks: np.ndarray):
+    """Write a header-prefixed uint16 shard. Header int32[2] = num_tokens."""
+    assert toks.dtype == np.uint16
+    header = np.zeros(HEADER_INTS, dtype=np.int32)
+    header[0] = SHARD_MAGIC
+    header[1] = SHARD_VERSION
+    header[2] = int(toks.size)
+    with open(path, "wb") as fh:
+        fh.write(header.tobytes())
+        fh.write(toks.tobytes())
+
+
 def process_shards(src_pattern: str, dst_dir: str, with_bytes: bool, label: str):
     os.makedirs(dst_dir, exist_ok=True)
     src_files = sorted(glob.glob(src_pattern))
@@ -93,20 +123,20 @@ def process_shards(src_pattern: str, dst_dir: str, with_bytes: bool, label: str)
     for src in src_files:
         name = os.path.basename(src)
         dst = os.path.join(dst_dir, name)
-        toks = np.fromfile(src, dtype=np.uint16)
+        _hdr, toks = _read_shard_with_header(src)
         bytes_arr = None
         if with_bytes:
             bp = src.replace("fineweb_val_", "fineweb_val_bytes_")
             if os.path.exists(bp):
-                bytes_arr = np.fromfile(bp, dtype=np.uint16)
+                _hdr_b, bytes_arr = _read_shard_with_header(bp)
                 if len(bytes_arr) != len(toks):
                     raise RuntimeError(f"length mismatch: {bp} ({len(bytes_arr)}) vs {src} ({len(toks)})")
             else:
                 print(f"    WARN: bytes sidecar missing for {name}")
         new_toks, new_bytes = fuse_stream(toks, bytes_arr)
-        new_toks.tofile(dst)
+        _write_shard_with_header(dst, new_toks)
         if with_bytes and new_bytes is not None:
-            new_bytes.tofile(dst.replace("fineweb_val_", "fineweb_val_bytes_"))
+            _write_shard_with_header(dst.replace("fineweb_val_", "fineweb_val_bytes_"), new_bytes)
         saved = len(toks) - len(new_toks)
         total_in += len(toks)
         total_out += len(new_toks)
