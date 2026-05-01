@@ -8,6 +8,14 @@ import struct
 import sys
 import time
 import uuid
+import warnings
+# Suppress informational PyTorch-Inductor warning about split-reduction online softmax.
+# It is emitted whenever Inductor chooses a split reduction for a softmax kernel; it does
+# not indicate a correctness issue or a meaningful performance regression for this stack.
+warnings.filterwarnings(
+    "ignore",
+    message=r".*Online softmax is disabled on the fly.*",
+)
 from pathlib import Path
 import brotli
 import numpy as np
