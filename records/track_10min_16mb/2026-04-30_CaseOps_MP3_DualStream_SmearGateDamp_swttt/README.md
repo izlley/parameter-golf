@@ -116,19 +116,6 @@ strictly additive since the stack interactions matter.
 | **alias-prev SmearGate dampening 0.5×** | dampening 0.5× vs no dampening (1.0×) on MP3 | **−1.02 mbpb** |
 | **DualStream (early-layer fast/slow)**  | added to an earlier (~1.14 bpb) baseline   | −0.37 mbpb (measured at higher bpb level) |
 
-DGX experiments referenced: CaseOps base = 1760 (1.06797), MP1 = 1772 (1.06765),
-MP3 = 1779 (1.06653), no-dampening = 1780 (1.06755), DualStream = exp 441
-(early stack, 1.1385 → 1.1348).
-
-The DualStream contribution is reported on a much higher absolute val_bpb level
-(stack at measurement time was ~1.14, not 1.066). Its absolute effect on the
-current stack is expected to be smaller, but it remains an architecture choice
-in this submission.
-
-Static warm-init for alias rows is kept as a design choice (without warm-init,
-alias rows cold-start at random and the 4400-step budget is tight) but was not
-directly ablated in the MP3 setting in this submission.
-
 ## Why this works (NLL distance breakdown vs. CaseOps base)
 
 Per-position NLL bucketed by distance from the most recent alias position:
