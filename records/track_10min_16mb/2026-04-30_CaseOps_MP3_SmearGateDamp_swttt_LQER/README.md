@@ -20,30 +20,45 @@ word, alias-prev positions get a **0.5× SmearGate dampening** (`ALIAS_PREV_SMEA
 
 ## Architecture
 
-| Component | Setting | Source |
-|-----------|---------|--------|
-| Layers | 11 (512d, 8 GQA heads, 4 KV heads) | Baseline |
-| MLP | 4× (2048) with LeakyReLU(0.5)² | [#493](https://github.com/openai/parameter-golf/pull/493) |
-| Attention | FA3, GQA 2:1 | Baseline |
-| XSA | All 11 layers | [#478](https://github.com/openai/parameter-golf/pull/478) |
-| RoPE | Partial (16/64 dims) | [#315](https://github.com/openai/parameter-golf/pull/315) |
-| LN scale | 1/√(layer+1) | [#315](https://github.com/openai/parameter-golf/pull/315) |
-| QK Gain | per-head, init=5.25 | [#1276](https://github.com/openai/parameter-golf/pull/1276) |
-| U-Net skips | encoder–decoder + skip gates | [#289](https://github.com/openai/parameter-golf/pull/289) |
-| Parallel decoder | 2-lane from layer 7+ | [#1530](https://github.com/openai/parameter-golf/pull/1530) |
-| Depth recurrence | layers 3-5, 3× loop, frac ≥ 0.35 | [#1344](https://github.com/openai/parameter-golf/pull/1344) |
-| Logit softcap | 30 | Gemma2 |
-| **SmearGate** (BOS-fixed) | Position-mixing + **alias-prev 0.5× dampening** | [#1667](https://github.com/openai/parameter-golf/pull/1667) + this work (alias dampening) |
-| **Polar-Express Newton-Schulz** | Muon, 5 steps | [#1344](https://github.com/openai/parameter-golf/pull/1344) → [#1787](https://github.com/openai/parameter-golf/pull/1787) |
-| **MIN_LR floor** | 0.10 | [#1787](https://github.com/openai/parameter-golf/pull/1787) |
-| **LQER asymmetric int4** | rank=4, top_k=3, asym_group=64 | [#1797](https://github.com/openai/parameter-golf/pull/1797) |
-| Tokenizer | sp8192 lossless caps caseops v1 reserved | [#1729](https://github.com/openai/parameter-golf/pull/1729) |
-| **MP3 marker-pair fusion** | warm-init alias rows + tied embedding (no extra params) | **this work** |
-| Quantization | GPTQ int6 (matrix) + int8 (embed) | [#535](https://github.com/openai/parameter-golf/pull/535) |
-| Optimizer | Polar-Express Muon (matrix) + AdamW (embed, scalars) | [#399](https://github.com/openai/parameter-golf/pull/399) |
-| Weight averaging | EMA(0.9965) + tight SWA (every 50) | [#401](https://github.com/openai/parameter-golf/pull/401) |
-| Compression | brotli q=11 | [#160](https://github.com/openai/parameter-golf/pull/160) |
-| **TTT (swttt)** | Sliding-window LoRA TTT — rank 32, layers 5-10, c_qkv module, lr=1e-4, B-norm cap=5.0, train_every=480 | [#461](https://github.com/openai/parameter-golf/pull/461) etc. |
+11L / 512d / 8 GQA heads (4 KV) / FA3 / partial RoPE 16/64 / MLP 4× (2048) with `LeakyReLU(0.5)².
+The standard transformer building blocks are baseline; the table below lists only the components
+that meaningfully shape this submission, in rough order of contribution.
+
+| # | Component | Setting | Source |
+|---|-----------|---------|--------|
+| 1 | **MP3 marker-pair fusion** | 3 alias donor tokens for `[▁,TITLE]`/`[▁,ALLCAPS]`/`[▁,CAPNEXT]`; warm-init `0.4·E[▁]+0.6·E[marker]`, norm-matched | **this work** |
+| 2 | **swttt (Sliding-window LoRA TTT)** | rank=32, layers 5-10, `c_qkv` module, lr=1e-4, B-norm cap=5.0, train_every=1024 windows | [#461](https://github.com/openai/parameter-golf/pull/461) |
+| 3 | **SmearGate (BOS-fixed) + alias-prev dampening** | window=12 position-mixing gate; **0.5× scale at alias-prev positions only** (regular positions unchanged) | [#1667](https://github.com/openai/parameter-golf/pull/1667) + **this work** |
+| 4 | **LQER asymmetric int4** | rank=4 quant-error correction on top-3 (largest Frobenius residual) tensors, asym_group=64 | [#1797](https://github.com/openai/parameter-golf/pull/1797) |
+| 5 | **Polar-Express MuonEqR** | Muon with **row L2 normalization (EQ-R)** before Newton-Schulz, 5 steps using per-iter minimax-tuned (Polar-Express) tuples | [#1344](https://github.com/openai/parameter-golf/pull/1344) + [#1787](https://github.com/openai/parameter-golf/pull/1787) |
+| 6 | **DualStream + Parallel residuals (L7+)** | Layers 0-6 use a fast/slow EMA stream (DualStream, **this work**); layers 7-10 switch to 2-lane parallel residual blocks | DualStream **this work**, parallel residuals from [#1530](https://github.com/openai/parameter-golf/pull/1530) |
+| 7 | **Depth recurrence (L3-5)** | Layers 3-5 looped 2 extra times once `step ≥ 2000` | [#1344](https://github.com/openai/parameter-golf/pull/1344) |
+| 8 | **CaseOps tokenizer** | sp8192 lossless caps + 4 reserved markers (TITLE/ALLCAPS/CAPNEXT/ESC); donors 8/9/10 are byte-fallback IDs with 0 occurrences | [#1729](https://github.com/openai/parameter-golf/pull/1729) |
+| 9 | **XSA on all 11 layers** | Cross-Sequence Attention enabled on every block | [#478](https://github.com/openai/parameter-golf/pull/478) |
+| 10 | **GPTQ int6 + int8 embed + brotli q=11** | int6 weights via GPTQ Hessian (calib batches=64), int8 token embedding, monolithic brotli compression on the quant blob | [#535](https://github.com/openai/parameter-golf/pull/535), [#160](https://github.com/openai/parameter-golf/pull/160) |
+
+## DualStream (this work)
+
+Layers 0-6 carry **two parallel residual streams** instead of a single residual.
+The "fast" stream is the standard pre-LN attention + MLP path. The "slow"
+stream is a low-pass companion that tracks longer-range trends. The two streams
+exchange information once per block via two learned scalar gates:
+
+```
+slow ← slow + σ(slow_gate) · (fast − slow)     # slow absorbs from fast
+fast ← fast + σ(read_gate) · (slow − fast)     # fast reads from slow
+```
+
+`slow_gate` initializes at `sigmoid(-2) ≈ 0.12` (slow update rate); `read_gate`
+at `sigmoid(-3) ≈ 0.05` (weak read). Both are per-block learned floats. The
+slow stream is initialized as a copy of `fast` at layer 0 entry. From layer 7
+onward DualStream is dropped in favour of 2-lane parallel residuals
+([#1530](https://github.com/openai/parameter-golf/pull/1530)) so the late
+layers can apply the standard wide-residual + MLP combination.
+
+Empirically this gives the early layers a temporal-EMA-like memory channel
+that the bare residual stack does not have, without changing parameter count
+beyond two scalars per block.
 
 ## MP3 marker-pair fusion (vocabulary surgery)
 
@@ -87,7 +102,7 @@ torch.compile data-dependent branching).
 
 Per-position NLL bucketed by distance from the most recent alias position:
 
-| distance | 1772 (MP1, single TITLE pair) | **1779 (MP3, 3-pair)** |
+| distance | MP1 (single TITLE pair only) | **MP3 (3 marker pairs, this work)** |
 |---|---|---|
 | d=1 (next word) | +0.159 mbpb | **−0.017** ✓ (preserved) |
 | d=2             | +1.096        | +0.262 |
@@ -136,25 +151,29 @@ pip install --no-deps flash_attn_3 \
     --find-links https://windreamer.github.io/flash-attention3-wheels/cu128_torch291/
 ```
 
-### 1a. Download raw FineWeb-10B docs (one-time, ~50 GB on disk, ~30 min)
-
-The canonical `docs_selected.jsonl` is produced by the upstream parameter-golf
-repo's data downloader (already included in this fork at `data/`):
+### 1a. Download raw FineWeb-10B docs (one-time, ~45 GiB on disk)
 
 ```bash
-# from the repo root (parent of records/)
-python3 data/download_hf_docs_and_tokenize.py
-# writes ./data/datasets/fineweb10B_raw/docs_selected.jsonl
+# from this submission directory
+python3 download_docs.py
+# writes ./data/datasets/docs_selected.jsonl  (~45 GiB)
+#        ./data/datasets/docs_selected.source_manifest.json
 ```
 
-### 1b. CaseOps tokenization (one-time, ~30-60 min)
+`download_docs.py` is a minimal HF Hub wrapper that fetches only the raw doc
+stream (the upstream `data/download_hf_docs_and_tokenize.py` would additionally
+re-tokenize with several vocab specs we do not use).
+
+### 1b. CaseOps tokenization (one-time)
 
 Tokenizes `docs_selected.jsonl` into CaseOps shards plus the val byte sidecar.
 
 ```bash
 # from this submission directory
 python3 prepare_caseops_data.py \
-    --docs ../../../data/datasets/fineweb10B_raw/docs_selected.jsonl
+    --docs ./data/datasets/docs_selected.jsonl \
+    --out  ./data \
+    --sp   tokenizers/fineweb_8192_bpe_lossless_caps_caseops_v1_reserved.model
 # writes ./data/datasets/fineweb10B_sp8192_lossless_caps_caseops_v1_reserved/
 #   fineweb_train_*.bin
 #   fineweb_val_*.bin
